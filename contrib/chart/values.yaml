@@ -151,7 +151,16 @@ sandbox:
 
 repoCache:
   enabled: false
+  # hostPath is kept for local/dev clusters. Production clusters should prefer
+  # persistence.enabled so sandboxes mount a PVC instead of a node filesystem path.
   hostPath: /var/lib/centaur/repos
+  persistence:
+    enabled: false
+    existingClaim: ""
+    size: 20Gi
+    storageClassName: ""
+    accessModes:
+      - ReadWriteOnce
   repositories: []
   syncIntervalSeconds: 300
   image:

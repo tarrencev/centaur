@@ -102,6 +102,19 @@
       "properties": {
         "enabled": { "type": "boolean" },
         "hostPath": { "type": "string" },
+        "persistence": {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "existingClaim": { "type": "string" },
+            "size": { "type": "string" },
+            "storageClassName": { "type": "string" },
+            "accessModes": {
+              "type": "array",
+              "items": { "type": "string" }
+            }
+          }
+        },
         "repositories": {
           "type": "array",
           "items": { "type": "string" }

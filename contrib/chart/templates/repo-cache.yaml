@@ -5,13 +5,34 @@
 {{- $repoCacheImageRepository := default .Values.sandbox.image.repository .Values.repoCache.image.repository -}}
 {{- $repoCacheImageTag := default .Values.sandbox.image.tag .Values.repoCache.image.tag -}}
 {{- $repoCacheImagePullPolicy := default .Values.sandbox.image.pullPolicy .Values.repoCache.image.pullPolicy -}}
+{{- if and .Values.repoCache.persistence.enabled (not .Values.repoCache.persistence.existingClaim) }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "centaur.repoCachePvcName" . }}
+  labels:
+{{ include "centaur.componentLabels" (dict "root" . "component" "repo-cache") | nindent 4 }}
+spec:
+  accessModes:
+{{ toYaml .Values.repoCache.persistence.accessModes | nindent 4 }}
+  {{- with .Values.repoCache.persistence.storageClassName }}
+  storageClassName: {{ . | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.repoCache.persistence.size }}
+---
+{{- end }}
 apiVersion: apps/v1
-kind: DaemonSet
+kind: {{ ternary "Deployment" "DaemonSet" .Values.repoCache.persistence.enabled }}
 metadata:
   name: {{ include "centaur.componentName" (dict "root" . "component" "repo-cache") }}
   labels:
 {{ include "centaur.componentLabels" (dict "root" . "component" "repo-cache") | nindent 4 }}
 spec:
+{{- if .Values.repoCache.persistence.enabled }}
+  replicas: 1
+{{- end }}
   selector:
     matchLabels:
 {{ include "centaur.componentSelectorLabels" (dict "root" . "component" "repo-cache") | nindent 6 }}
@@ -139,9 +160,14 @@ spec:
               readOnly: true
       volumes:
         - name: repo-cache
+{{- if .Values.repoCache.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ include "centaur.repoCachePvcName" . }}
+{{- else }}
           hostPath:
             path: {{ .Values.repoCache.hostPath | quote }}
             type: DirectoryOrCreate
+{{- end }}
         - name: github-token
           secret:
             secretName: {{ include "centaur.repoCacheGithubTokenSecretName" . }}

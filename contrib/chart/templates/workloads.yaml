@@ -1,6 +1,12 @@
 {{- $reposPath := .Values.sandbox.reposPath -}}
+{{- $reposPvcClaimName := "" -}}
 {{- $apiExtraEnv := .Values.api.extraEnv | default dict -}}
-{{- if and .Values.repoCache.enabled (not $reposPath) -}}
+{{- if and .Values.repoCache.enabled .Values.repoCache.persistence.enabled -}}
+{{- if $reposPath -}}
+{{- fail "sandbox.reposPath cannot be set when repoCache.persistence.enabled=true" -}}
+{{- end -}}
+{{- $reposPvcClaimName = include "centaur.repoCachePvcName" . -}}
+{{- else if and .Values.repoCache.enabled (not $reposPath) -}}
 {{- $reposPath = .Values.repoCache.hostPath -}}
 {{- end -}}
 {{- if .Values.postgres.enabled }}
@@ -365,6 +371,10 @@ spec:
 {{- if $reposPath }}
             - name: REPOS_PATH
               value: {{ $reposPath | quote }}
+{{- end }}
+{{- if $reposPvcClaimName }}
+            - name: REPOS_PVC_CLAIM_NAME
+              value: {{ $reposPvcClaimName | quote }}
 {{- end }}
 {{- with .Values.sandbox.extraEnv }}
 {{- $envList := list }}

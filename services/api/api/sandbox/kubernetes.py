@@ -341,6 +341,35 @@ def _repos_path() -> str | None:
     return value or None
 
 
+def _repos_pvc_claim_name() -> str | None:
+    value = (os.getenv("REPOS_PVC_CLAIM_NAME") or "").strip()
+    return value or None
+
+
+def _repos_volume() -> dict[str, Any] | None:
+    repos_path = _repos_path()
+    repos_pvc_claim_name = _repos_pvc_claim_name()
+    if repos_path and repos_pvc_claim_name:
+        raise ValueError("Only one of REPOS_PATH or REPOS_PVC_CLAIM_NAME may be set")
+    if repos_pvc_claim_name:
+        return {
+            "name": "repos",
+            "persistentVolumeClaim": {
+                "claimName": repos_pvc_claim_name,
+                "readOnly": True,
+            },
+        }
+    if repos_path:
+        return {
+            "name": "repos",
+            "hostPath": {
+                "path": repos_path,
+                "type": "Directory",
+            },
+        }
+    return None
+
+
 def _overlay_image() -> str | None:
     value = (os.getenv("CENTAUR_OVERLAY_IMAGE") or "").strip()
     return value or None
@@ -1299,8 +1328,8 @@ class KubernetesExecutorBackend(SandboxBackend):
         _ensure_kubernetes_env()
         await self._ensure_clients()
 
-        repos_path = _repos_path()
-        if repo and not repos_path:
+        repos_volume = _repos_volume()
+        if repo and not repos_volume:
             raise ValueError("REPOS_PATH is required when AGENT_REPO is set")
 
         runtime_key = f"{thread_key}:{uuid.uuid4().hex[:8]}"
@@ -1421,7 +1450,7 @@ class KubernetesExecutorBackend(SandboxBackend):
                 }
             )
 
-        if repos_path:
+        if repos_volume:
             volume_mounts.append(
                 {
                     "name": "repos",
@@ -1429,15 +1458,7 @@ class KubernetesExecutorBackend(SandboxBackend):
                     "readOnly": True,
                 }
             )
-            volumes.append(
-                {
-                    "name": "repos",
-                    "hostPath": {
-                        "path": repos_path,
-                        "type": "Directory",
-                    },
-                }
-            )
+            volumes.append(repos_volume)
 
         self._configure_workload_volumes(volume_mounts, volumes)
 

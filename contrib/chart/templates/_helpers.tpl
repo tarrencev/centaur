@@ -63,6 +63,14 @@ app.kubernetes.io/component: {{ .component }}
 {{- end -}}
 {{- end -}}
 
+{{- define "centaur.repoCachePvcName" -}}
+{{- if .Values.repoCache.persistence.existingClaim -}}
+{{- .Values.repoCache.persistence.existingClaim | trunc 63 | trimSuffix "-" -}}
+{{- else -}}
+{{- include "centaur.componentName" (dict "root" . "component" "repo-cache") -}}
+{{- end -}}
+{{- end -}}
+
 {{- define "centaur.httpRouteName" -}}
 {{- $suffix := default (printf "route-%v" .index) .route.name -}}
 {{- printf "%s-%s" (include "centaur.fullname" .root) $suffix | trunc 63 | trimSuffix "-" -}}
