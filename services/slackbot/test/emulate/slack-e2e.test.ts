@@ -19,13 +19,14 @@ const CHANNEL_ID = 'C000000001'
 type WorkflowRunRequest = {
   workflow_name: string
   trigger_key: string
+  eager_start?: boolean
   input: {
     thread_key: string
     parts: Array<{ type: string; text?: string }>
     history_messages?: Array<{ role: string; parts: Array<{ type: string; text?: string }> }>
     message_id: string
     user_id: string
-    metadata: { is_mention?: boolean; slack?: Record<string, unknown> }
+    metadata: { is_mention?: boolean; is_actionable?: boolean; slack?: Record<string, unknown> }
     delivery: {
       platform: string
       channel: string
@@ -133,7 +134,7 @@ describe(`Slack Emulate E2E (${IMPLEMENTATION})`, () => {
 
     const run = onlyRun()
     expect(run.workflow_name).toBe('slack_thread_turn')
-    expect('eager_start' in run).toBe(false)
+    expect(run).toMatchObject({ eager_start: true })
     expect(run.trigger_key).toBe(`slack:${TEAM_ID}:${CHANNEL_ID}:${parent.ts}`)
     expect(run.input.thread_key).toBe(`slack:${TEAM_ID}:${CHANNEL_ID}:${parent.ts}`)
     expect(run.input.message_id).toBe(`slack:${TEAM_ID}:${CHANNEL_ID}:${parent.ts}`)
@@ -184,6 +185,44 @@ describe(`Slack Emulate E2E (${IMPLEMENTATION})`, () => {
     expect(history.flatMap(item => item.parts.map(part => part.text))).toContain(
       'Prior user clarification'
     )
+  })
+
+  it('dispatches plain replies in existing Centaur threads', async () => {
+    const parent = await postUserMessage(`<@${BOT_USER_ID}> suh`)
+    await postBotMessage('suh', parent.ts)
+    const current = await postUserMessage('yooo', parent.ts)
+    const waits: Promise<unknown>[] = []
+
+    const response = await app.request(
+      '/api/webhooks/slack',
+      signedSlackEvent({
+        event_id: 'Ev-emulate-plain-thread-reply',
+        event: {
+          type: 'message',
+          user: USER_ID,
+          channel: CHANNEL_ID,
+          ts: current.ts,
+          thread_ts: parent.ts,
+          text: 'yooo'
+        }
+      }),
+      {},
+      waitUntilContext(waits)
+    )
+
+    expect(response.status).toBe(200)
+    expect(await response.json()).toEqual({ ok: true })
+    await Promise.all(waits)
+
+    const run = onlyRun()
+    expect(run.workflow_name).toBe('slack_thread_turn')
+    expect(run.trigger_key).toBe(`slack:${TEAM_ID}:${CHANNEL_ID}:${current.ts}`)
+    expect(run.input.thread_key).toBe(`slack:${TEAM_ID}:${CHANNEL_ID}:${parent.ts}`)
+    expect(run.input.message_id).toBe(`slack:${TEAM_ID}:${CHANNEL_ID}:${current.ts}`)
+    expect(run.input.parts).toEqual([{ type: 'text', text: 'yooo' }])
+    expect(run.input.metadata.is_mention).toBe(false)
+    expect(run.input.metadata.is_actionable).toBe(true)
+    expect(run.input.history_messages?.map(item => item.role)).toEqual(['user', 'assistant'])
   })
 
   it('dispatches an Alertmanager-style bot-authored mention into a Slack workflow', async () => {
