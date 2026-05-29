@@ -873,6 +873,10 @@ def test_render_emits_header_and_gcp_auth_transforms(
     cfg = yaml.safe_load(render_proxy_yaml(secrets))
     names = [t["name"] for t in cfg["transforms"]]
     assert names == ["allowlist", "secrets", "gcp_auth", "header_allowlist"]
+    header_allowlist = next(
+        t for t in cfg["transforms"] if t["name"] == "header_allowlist"
+    )
+    assert "content-encoding" in header_allowlist["config"]["headers"]
     secrets_block = next(t for t in cfg["transforms"] if t["name"] == "secrets")
     entry = secrets_block["config"]["secrets"][0]
     assert "inject" not in entry
