@@ -2,7 +2,9 @@ name: Publish Images
 
 on:
   push:
-    branches: [main]
+    branches:
+      - main
+      - release/c7e-centaur-tools-repo-cache-20260529
     tags: [v*]
     paths:
       - .github/workflows/publish-images.yml
