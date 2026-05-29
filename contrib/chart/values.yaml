@@ -151,7 +151,19 @@ sandbox:
 
 repoCache:
   enabled: false
+  # Select how sandboxes get faster Git checkouts.
+  # hostPath mounts a per-node cache; mirror serves a PVC-backed HTTP Git cache.
+  mode: hostPath # hostPath | mirror
   hostPath: /var/lib/centaur/repos
+  service:
+    port: 8080
+  # PVC settings used only by mode=mirror.
+  persistence:
+    existingClaim: ""
+    size: 20Gi
+    storageClassName: ""
+    accessModes:
+      - ReadWriteOnce
   repositories: []
   syncIntervalSeconds: 300
   image:

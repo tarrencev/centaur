@@ -1,6 +1,7 @@
-{{- if .Values.repoCache.enabled }}
+{{- $repoCacheMode := include "centaur.repoCacheMode" . -}}
+{{- if and .Values.repoCache.enabled (eq $repoCacheMode "hostPath") }}
 {{- if not .Values.repoCache.repositories }}
-{{- fail "repoCache.repositories must contain at least one owner/repo entry when repoCache.enabled=true" }}
+{{- fail "repoCache.repositories must contain at least one owner/repo entry when repoCache.mode=hostPath" }}
 {{- end }}
 {{- $repoCacheImageRepository := default .Values.sandbox.image.repository .Values.repoCache.image.repository -}}
 {{- $repoCacheImageTag := default .Values.sandbox.image.tag .Values.repoCache.image.tag -}}

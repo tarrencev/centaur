@@ -1,6 +1,10 @@
 {{- $reposPath := .Values.sandbox.reposPath -}}
+{{- $gitCacheURL := "" -}}
+{{- $repoCacheMode := include "centaur.repoCacheMode" . -}}
 {{- $apiExtraEnv := .Values.api.extraEnv | default dict -}}
-{{- if and .Values.repoCache.enabled (not $reposPath) -}}
+{{- if and .Values.repoCache.enabled (eq $repoCacheMode "mirror") -}}
+{{- $gitCacheURL = printf "http://%s:%v/repos" (include "centaur.componentName" (dict "root" . "component" "repo-cache")) .Values.repoCache.service.port -}}
+{{- else if and .Values.repoCache.enabled (eq $repoCacheMode "hostPath") (not $reposPath) -}}
 {{- $reposPath = .Values.repoCache.hostPath -}}
 {{- end -}}
 {{- if .Values.postgres.enabled }}
@@ -365,6 +369,10 @@ spec:
 {{- if $reposPath }}
             - name: REPOS_PATH
               value: {{ $reposPath | quote }}
+{{- end }}
+{{- if $gitCacheURL }}
+            - name: CENTAUR_GIT_CACHE_URL
+              value: {{ $gitCacheURL | quote }}
 {{- end }}
 {{- with .Values.sandbox.extraEnv }}
 {{- $envList := list }}

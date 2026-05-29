@@ -1,0 +1,160 @@
+{{- $repoCacheMode := include "centaur.repoCacheMode" . -}}
+{{- if and .Values.repoCache.enabled (eq $repoCacheMode "mirror") }}
+# mirror mode: sandboxes use an in-cluster HTTP Git cache instead of mounting storage.
+{{- $repoCacheImageRepository := default .Values.sandbox.image.repository .Values.repoCache.image.repository -}}
+{{- $repoCacheImageTag := default .Values.sandbox.image.tag .Values.repoCache.image.tag -}}
+{{- $repoCacheImagePullPolicy := default .Values.sandbox.image.pullPolicy .Values.repoCache.image.pullPolicy -}}
+{{- if not .Values.repoCache.persistence.existingClaim }}
+# Persistent storage for bare repository mirrors.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "centaur.repoCachePvcName" . }}
+  labels:
+{{ include "centaur.componentLabels" (dict "root" . "component" "repo-cache") | nindent 4 }}
+spec:
+  accessModes:
+{{ toYaml .Values.repoCache.persistence.accessModes | nindent 4 }}
+  {{- with .Values.repoCache.persistence.storageClassName }}
+  storageClassName: {{ . | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.repoCache.persistence.size }}
+---
+{{- end }}
+# Stable HTTP endpoint used by Git URL rewrites inside sandbox images.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "centaur.componentName" (dict "root" . "component" "repo-cache") }}
+  labels:
+{{ include "centaur.componentLabels" (dict "root" . "component" "repo-cache") | nindent 4 }}
+spec:
+  selector:
+{{ include "centaur.componentSelectorLabels" (dict "root" . "component" "repo-cache") | nindent 4 }}
+  ports:
+    - name: git-http
+      port: {{ .Values.repoCache.service.port }}
+      targetPort: git-http
+---
+# Single mirror server that lazily fetches repositories and serves Git smart HTTP.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "centaur.componentName" (dict "root" . "component" "repo-cache") }}
+  labels:
+{{ include "centaur.componentLabels" (dict "root" . "component" "repo-cache") | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+{{ include "centaur.componentSelectorLabels" (dict "root" . "component" "repo-cache") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+{{ include "centaur.componentSelectorLabels" (dict "root" . "component" "repo-cache") | nindent 8 }}
+    spec:
+      automountServiceAccountToken: false
+      {{- with .Values.global.imagePullSecrets }}
+      imagePullSecrets:
+{{ toYaml . | nindent 8 }}
+      {{- end }}
+{{- with .Values.repoCache.nodeSelector }}
+      nodeSelector:
+{{ toYaml . | nindent 8 }}
+{{- end }}
+{{- with .Values.repoCache.affinity }}
+      affinity:
+{{ toYaml . | nindent 8 }}
+{{- end }}
+{{- with .Values.repoCache.tolerations }}
+      tolerations:
+{{ toYaml . | nindent 8 }}
+{{- end }}
+      containers:
+        # Egress goes through iron-proxy so GitHub credentials stay out of sandboxes.
+        - name: repo-cache
+          image: {{ printf "%s:%s" $repoCacheImageRepository $repoCacheImageTag | quote }}
+          imagePullPolicy: {{ $repoCacheImagePullPolicy }}
+          ports:
+            - name: git-http
+              containerPort: {{ .Values.repoCache.service.port }}
+          command:
+            - /usr/local/bin/repo-cache-server
+          env:
+            - name: REPOSITORIES
+              value: {{ join " " .Values.repoCache.repositories | quote }}
+            - name: SYNC_INTERVAL_SECONDS
+              value: {{ .Values.repoCache.syncIntervalSeconds | quote }}
+            - name: GIT_TERMINAL_PROMPT
+              value: "0"
+            - name: HTTPS_PROXY
+              value: {{ include "centaur.firewallProxyUrl" . | quote }}
+            - name: HTTP_PROXY
+              value: {{ include "centaur.firewallProxyUrl" . | quote }}
+            - name: https_proxy
+              value: {{ include "centaur.firewallProxyUrl" . | quote }}
+            - name: http_proxy
+              value: {{ include "centaur.firewallProxyUrl" . | quote }}
+            - name: GIT_SSL_CAINFO
+              value: /firewall-certs/ca-cert.pem
+            - name: SSL_CERT_FILE
+              value: /firewall-certs/ca-cert.pem
+            - name: REQUESTS_CA_BUNDLE
+              value: /firewall-certs/ca-cert.pem
+            - name: NO_PROXY
+              value: {{ printf "localhost,127.0.0.1,%s" (include "centaur.firewallNoProxyHosts" .) | quote }}
+            - name: no_proxy
+              value: {{ printf "localhost,127.0.0.1,%s" (include "centaur.firewallNoProxyHosts" .) | quote }}
+            - name: REPO_CACHE_PORT
+              value: {{ .Values.repoCache.service.port | quote }}
+{{- if or .Values.repoCache.githubToken.existingSecretName .Values.repoCache.githubToken.token }}
+            - name: GITHUB_TOKEN_FILE
+              value: /github-token/token
+{{- end }}
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: git-http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            runAsGroup: 0
+            runAsUser: 0
+            seccompProfile:
+              type: RuntimeDefault
+          resources:
+{{ toYaml .Values.repoCache.resources | nindent 12 }}
+          volumeMounts:
+            - name: repo-cache
+              mountPath: /cache
+            - name: firewall-ca
+              mountPath: /firewall-certs
+              readOnly: true
+{{- if or .Values.repoCache.githubToken.existingSecretName .Values.repoCache.githubToken.token }}
+            - name: github-token
+              mountPath: /github-token
+              readOnly: true
+{{- end }}
+      volumes:
+        - name: repo-cache
+          persistentVolumeClaim:
+            claimName: {{ include "centaur.repoCachePvcName" . }}
+        - name: firewall-ca
+          secret:
+            secretName: {{ include "centaur.trustedCaSecretName" . }}
+{{- if or .Values.repoCache.githubToken.existingSecretName .Values.repoCache.githubToken.token }}
+        - name: github-token
+          secret:
+            secretName: {{ include "centaur.repoCacheGithubTokenSecretName" . }}
+            defaultMode: 256
+            items:
+              - key: {{ .Values.repoCache.githubToken.secretKey | quote }}
+                path: token
+{{- end }}
+{{- end }}

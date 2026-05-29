@@ -55,11 +55,23 @@ app.kubernetes.io/component: {{ .component }}
 {{- printf "%s-api" (include "centaur.fullname" .) | trunc 63 | trimSuffix "-" -}}
 {{- end -}}
 
+{{- define "centaur.repoCacheMode" -}}
+{{- default "hostPath" .Values.repoCache.mode -}}
+{{- end -}}
+
 {{- define "centaur.repoCacheGithubTokenSecretName" -}}
 {{- if .Values.repoCache.githubToken.existingSecretName -}}
 {{- .Values.repoCache.githubToken.existingSecretName | trunc 63 | trimSuffix "-" -}}
 {{- else -}}
 {{- printf "%s-repo-cache-github-token" (include "centaur.fullname" .) | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "centaur.repoCachePvcName" -}}
+{{- if .Values.repoCache.persistence.existingClaim -}}
+{{- .Values.repoCache.persistence.existingClaim | trunc 63 | trimSuffix "-" -}}
+{{- else -}}
+{{- include "centaur.componentName" (dict "root" . "component" "repo-cache") -}}
 {{- end -}}
 {{- end -}}
 
