@@ -1,5 +1,6 @@
 {{- if .Values.networkPolicy.enabled }}
 {{- $ingressSourceNamespaces := default .Values.networkPolicy.ingressControllerNamespaces .Values.networkPolicy.ingressSourceNamespaces }}
+{{- $repoCacheMode := include "centaur.repoCacheMode" . }}
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -309,11 +310,11 @@ spec:
     matchLabels:
 {{ include "centaur.componentSelectorLabels" (dict "root" . "component" "repo-cache") | nindent 6 }}
   policyTypes:
-{{- if .Values.repoCache.persistence.enabled }}
+{{- if eq $repoCacheMode "gitMirror" }}
     - Ingress
 {{- end }}
     - Egress
-{{- if .Values.repoCache.persistence.enabled }}
+{{- if eq $repoCacheMode "gitMirror" }}
   ingress:
     - from:
         - podSelector:
@@ -324,7 +325,7 @@ spec:
           port: {{ .Values.repoCache.service.port }}
 {{- end }}
   egress:
-{{- if .Values.repoCache.persistence.enabled }}
+{{- if eq $repoCacheMode "gitMirror" }}
     - to:
         - podSelector:
             matchLabels:
@@ -413,7 +414,7 @@ spec:
       ports:
         - protocol: TCP
           port: 8000
-{{- if and .Values.repoCache.enabled .Values.repoCache.persistence.enabled }}
+{{- if and .Values.repoCache.enabled (eq $repoCacheMode "gitMirror") }}
     - to:
         - podSelector:
             matchLabels:

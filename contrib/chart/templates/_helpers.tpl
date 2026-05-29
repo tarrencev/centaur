@@ -55,6 +55,10 @@ app.kubernetes.io/component: {{ .component }}
 {{- printf "%s-api" (include "centaur.fullname" .) | trunc 63 | trimSuffix "-" -}}
 {{- end -}}
 
+{{- define "centaur.repoCacheMode" -}}
+{{- default "hostPath" .Values.repoCache.mode -}}
+{{- end -}}
+
 {{- define "centaur.repoCacheGithubTokenSecretName" -}}
 {{- if .Values.repoCache.githubToken.existingSecretName -}}
 {{- .Values.repoCache.githubToken.existingSecretName | trunc 63 | trimSuffix "-" -}}
