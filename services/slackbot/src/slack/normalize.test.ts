@@ -212,7 +212,10 @@ describe('normalizeSlackEnvelope', () => {
               elements: [
                 {
                   type: 'rich_text_quote',
-                  elements: [{ type: 'user', user_id: 'UBOT' }, { type: 'text', text: ' help' }]
+                  elements: [
+                    { type: 'user', user_id: 'UBOT' },
+                    { type: 'text', text: ' help' }
+                  ]
                 },
                 {
                   type: 'rich_text_section',
@@ -437,6 +440,128 @@ describe('normalizeSlackEnvelope', () => {
         metadata: { platform: 'slack', history_backfill: true }
       }
     ])
+  })
+
+  it('treats plain replies in prior Centaur threads as actionable', async () => {
+    const replies = mock(async () => ({
+      ok: true,
+      messages: [
+        {
+          type: 'message',
+          user: 'U111',
+          channel: 'C123',
+          ts: '1778875060.000100',
+          text: '<@UBOT> suh'
+        },
+        {
+          type: 'message',
+          subtype: 'bot_message',
+          bot_id: 'BCENTAUR',
+          bot_profile: { user_id: 'UBOT', app_id: 'ACENTAUR', name: 'Gillen' },
+          channel: 'C123',
+          ts: '1778875062.000100',
+          text: 'suh'
+        },
+        {
+          type: 'message',
+          user: 'U123',
+          channel: 'C123',
+          ts: '1778875070.942789',
+          text: 'yooo'
+        }
+      ]
+    }))
+
+    const normalized = await normalizeSlackEnvelope({
+      envelope: {
+        type: 'event_callback',
+        team_id: 'T123',
+        event_id: 'Ev-thread-followup',
+        event: {
+          type: 'message',
+          user: 'U123',
+          channel: 'C123',
+          channel_type: 'channel',
+          thread_ts: '1778875060.000100',
+          ts: '1778875070.942789',
+          text: 'yooo'
+        }
+      },
+      botUserId: 'UBOT',
+      botId: 'BCENTAUR',
+      client: {
+        token: 'xoxb-test-token',
+        conversations: { replies }
+      } as any
+    })
+
+    expect(normalized?.is_mention).toBe(false)
+    expect(normalized?.is_actionable).toBe(true)
+    expect(normalized?.parts).toEqual([{ type: 'text', text: 'yooo' }])
+    expect(normalized?.history_messages).toEqual([
+      {
+        message_id: 'slack:T123:C123:1778875060.000100',
+        role: 'user',
+        parts: [{ type: 'text', text: 'suh' }],
+        user_id: 'U111',
+        metadata: { platform: 'slack', history_backfill: true, mentions_bot: true }
+      },
+      {
+        message_id: 'slack:T123:C123:1778875062.000100',
+        role: 'assistant',
+        parts: [{ type: 'text', text: 'suh' }],
+        user_id: 'UBOT',
+        metadata: { platform: 'slack', history_backfill: true }
+      }
+    ])
+  })
+
+  it('keeps plain replies outside Centaur threads non-actionable', async () => {
+    const replies = mock(async () => ({
+      ok: true,
+      messages: [
+        {
+          type: 'message',
+          user: 'U111',
+          channel: 'C123',
+          ts: '1778875060.000100',
+          text: 'ordinary thread'
+        },
+        {
+          type: 'message',
+          user: 'U123',
+          channel: 'C123',
+          ts: '1778875070.942789',
+          text: 'yooo'
+        }
+      ]
+    }))
+
+    const normalized = await normalizeSlackEnvelope({
+      envelope: {
+        type: 'event_callback',
+        team_id: 'T123',
+        event_id: 'Ev-ordinary-thread-followup',
+        event: {
+          type: 'message',
+          user: 'U123',
+          channel: 'C123',
+          channel_type: 'channel',
+          thread_ts: '1778875060.000100',
+          ts: '1778875070.942789',
+          text: 'yooo'
+        }
+      },
+      botUserId: 'UBOT',
+      botId: 'BCENTAUR',
+      client: {
+        token: 'xoxb-test-token',
+        conversations: { replies }
+      } as any
+    })
+
+    expect(normalized?.is_mention).toBe(false)
+    expect(normalized?.is_actionable).toBe(false)
   })
 
   it('does not duplicate text when Slack sends both rich_text blocks and event.text', async () => {
