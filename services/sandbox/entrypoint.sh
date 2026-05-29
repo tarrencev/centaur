@@ -153,19 +153,22 @@ else
 fi
 if [ -n "${AGENT_REPO:-}" ]; then
     REPO_PATH="$HOME_DIR/github/$AGENT_REPO"
-    if ! git -C "$REPO_PATH" rev-parse --git-dir >/dev/null 2>&1; then
-        echo "AGENT_REPO is not a valid git repository: $REPO_PATH" >&2
-        exit 1
-    fi
+    REPO_URL="https://github.com/${AGENT_REPO}.git"
 
     if ! git -C "$WORKSPACE_DIR" rev-parse --git-dir >/dev/null 2>&1; then
         rm -rf "$WORKSPACE_DIR"
-        if ! git clone --quiet --shared "$REPO_PATH" "$WORKSPACE_DIR"; then
-            echo "shared clone failed for $REPO_PATH; retrying with regular clone" >&2
-            rm -rf "$WORKSPACE_DIR"
-            git clone --quiet "$REPO_PATH" "$WORKSPACE_DIR"
+        if git -C "$REPO_PATH" rev-parse --git-dir >/dev/null 2>&1; then
+            if ! git clone --quiet --shared "$REPO_PATH" "$WORKSPACE_DIR"; then
+                echo "shared clone failed for $REPO_PATH; retrying with regular clone" >&2
+                rm -rf "$WORKSPACE_DIR"
+                git clone --quiet "$REPO_PATH" "$WORKSPACE_DIR"
+            fi
+        else
+            git clone --quiet "$REPO_URL" "$WORKSPACE_DIR"
         fi
 
+        git -C "$WORKSPACE_DIR" remote set-url origin "$REPO_URL" || true
+        git -C "$WORKSPACE_DIR" remote set-url --push origin "$REPO_URL" || true
         BRANCH="agent-$(date +%s)-${RANDOM}-${RANDOM}"
         git -C "$WORKSPACE_DIR" checkout -q -b "$BRANCH" || true
     fi

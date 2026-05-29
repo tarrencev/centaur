@@ -341,24 +341,13 @@ def _repos_path() -> str | None:
     return value or None
 
 
-def _repos_pvc_claim_name() -> str | None:
-    value = (os.getenv("REPOS_PVC_CLAIM_NAME") or "").strip()
+def _git_cache_url() -> str | None:
+    value = (os.getenv("CENTAUR_GIT_CACHE_URL") or "").strip().rstrip("/")
     return value or None
 
 
 def _repos_volume() -> dict[str, Any] | None:
     repos_path = _repos_path()
-    repos_pvc_claim_name = _repos_pvc_claim_name()
-    if repos_path and repos_pvc_claim_name:
-        raise ValueError("Only one of REPOS_PATH or REPOS_PVC_CLAIM_NAME may be set")
-    if repos_pvc_claim_name:
-        return {
-            "name": "repos",
-            "persistentVolumeClaim": {
-                "claimName": repos_pvc_claim_name,
-                "readOnly": True,
-            },
-        }
     if repos_path:
         return {
             "name": "repos",
@@ -1329,8 +1318,6 @@ class KubernetesExecutorBackend(SandboxBackend):
         await self._ensure_clients()
 
         repos_volume = _repos_volume()
-        if repo and not repos_volume:
-            raise ValueError("REPOS_PATH is required when AGENT_REPO is set")
 
         runtime_key = f"{thread_key}:{uuid.uuid4().hex[:8]}"
         pod_name = _resource_name("centaur-centaur-sandbox", runtime_key)
@@ -1369,6 +1356,9 @@ class KubernetesExecutorBackend(SandboxBackend):
             env.append(f"AGENT_PERSONA={persona}")
         if repo:
             env.append(f"AGENT_REPO={repo}")
+        git_cache_url = _git_cache_url()
+        if git_cache_url:
+            env.append(f"CENTAUR_GIT_CACHE_URL={git_cache_url}")
 
         labels = {
             "centaur.ai/sandbox-id": pod_name,

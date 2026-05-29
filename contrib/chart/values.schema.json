@@ -102,6 +102,12 @@
       "properties": {
         "enabled": { "type": "boolean" },
         "hostPath": { "type": "string" },
+        "service": {
+          "type": "object",
+          "properties": {
+            "port": { "type": "integer" }
+          }
+        },
         "persistence": {
           "type": "object",
           "properties": {

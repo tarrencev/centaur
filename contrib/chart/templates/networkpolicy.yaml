@@ -309,12 +309,36 @@ spec:
     matchLabels:
 {{ include "centaur.componentSelectorLabels" (dict "root" . "component" "repo-cache") | nindent 6 }}
   policyTypes:
+{{- if .Values.repoCache.persistence.enabled }}
+    - Ingress
+{{- end }}
     - Egress
+{{- if .Values.repoCache.persistence.enabled }}
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              centaur.ai/managed: "true"
+      ports:
+        - protocol: TCP
+          port: {{ .Values.repoCache.service.port }}
+{{- end }}
   egress:
+{{- if .Values.repoCache.persistence.enabled }}
+    - to:
+        - podSelector:
+            matchLabels:
+              centaur.ai/iron-proxy: "true"
+              centaur.ai/sandbox-id: api
+      ports:
+        - protocol: TCP
+          port: {{ .Values.ironProxy.service.proxyPort }}
+{{- else }}
 {{- range .Values.repoCache.egressPorts }}
     - ports:
         - protocol: TCP
           port: {{ . }}
+{{- end }}
 {{- end }}
 ---
 {{- end }}
@@ -389,4 +413,13 @@ spec:
       ports:
         - protocol: TCP
           port: 8000
+{{- if and .Values.repoCache.enabled .Values.repoCache.persistence.enabled }}
+    - to:
+        - podSelector:
+            matchLabels:
+{{ include "centaur.componentSelectorLabels" (dict "root" . "component" "repo-cache") | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.repoCache.service.port }}
+{{- end }}
 {{- end }}

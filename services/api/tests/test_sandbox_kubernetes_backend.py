@@ -487,27 +487,60 @@ async def test_ensure_clients_disables_proxy_env(
 
 
 @pytest.mark.asyncio
-async def test_create_requires_repo_cache_volume_for_repo(
+async def test_create_allows_agent_repo_without_repo_volume(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     backend = KubernetesExecutorBackend()
+    fake_core = FakeCoreApi()
+    fake_networking = FakeNetworkingApi()
+    backend._core = fake_core
+    backend._networking = fake_networking
 
-    monkeypatch.setenv("AGENT_API_URL", "http://api:8000")
-    monkeypatch.setenv("FIREWALL_HOST", "firewall")
+    monkeypatch.setenv("AGENT_API_URL", "http://api.internal:8000")
+    monkeypatch.setenv("DATABASE_URL", "postgres://user:pass@db/centaur")
+    monkeypatch.setenv("FIREWALL_HOST", "firewall.internal")
     monkeypatch.setenv("KUBERNETES_FIREWALL_CA_SECRET_NAME", "firewall-ca")
+    monkeypatch.setenv("KUBERNETES_NAMESPACE", "centaur-sandbox")
+    monkeypatch.setattr(
+        "api.sandbox.kubernetes._prompt_bundle",
+        lambda persona: f"prompt:{persona}",
+    )
+    monkeypatch.setattr(
+        "api.sandbox.kubernetes.container_env",
+        lambda *_args, **_kwargs: [
+            "CENTAUR_API_URL=http://api.internal:8000",
+            "CENTAUR_API_KEY=sandbox-token",
+        ],
+    )
+    monkeypatch.setattr(
+        "api.sandbox.kubernetes.build_harness_cmd", lambda *_args: ["amp-wrapper"]
+    )
+    monkeypatch.setattr("api.sandbox.kubernetes.image", lambda: "centaur-agent:test")
 
     async def fake_ensure_clients() -> None:
         return None
 
-    monkeypatch.setattr(backend, "_ensure_clients", fake_ensure_clients)
+    async def fake_wait_ready(_pod_name: str) -> float:
+        return 0.01
 
-    with pytest.raises(ValueError, match="REPOS_PATH is required"):
-        await backend.create(
-            "slack:C123:123.456",
-            "amp",
-            "amp",
-            repo="paradigmxyz/centaur",
-        )
+    monkeypatch.setattr(backend, "_ensure_clients", fake_ensure_clients)
+    monkeypatch.setattr(backend, "_wait_pod_ready", fake_wait_ready)
+    monkeypatch.setattr(backend, "_wait_ready", fake_wait_ready)
+
+    await backend.create(
+        "slack:C123:123.456",
+        "amp",
+        "amp",
+        repo="paradigmxyz/centaur",
+    )
+
+    pod_body = fake_core.created_pods[1][1]
+    container = pod_body["spec"]["containers"][0]
+    env = {item["name"]: item["value"] for item in container["env"]}
+
+    assert env["AGENT_REPO"] == "paradigmxyz/centaur"
+    assert all(mount["name"] != "repos" for mount in container["volumeMounts"])
+    assert all(volume["name"] != "repos" for volume in pod_body["spec"]["volumes"])
 
 
 @pytest.mark.asyncio
@@ -1255,6 +1288,7 @@ async def test_create_mounts_repo_cache_host_path(
     backend._networking = fake_networking
 
     monkeypatch.setenv("AGENT_API_URL", "http://api.internal:8000")
+    monkeypatch.setenv("DATABASE_URL", "postgres://user:pass@db/centaur")
     monkeypatch.setenv("FIREWALL_HOST", "firewall.internal")
     monkeypatch.setenv("KUBERNETES_FIREWALL_CA_SECRET_NAME", "firewall-ca")
     monkeypatch.setenv("REPOS_PATH", "/var/lib/centaur/repos")
@@ -1309,7 +1343,7 @@ async def test_create_mounts_repo_cache_host_path(
 
 
 @pytest.mark.asyncio
-async def test_create_mounts_repo_cache_pvc(
+async def test_create_passes_git_cache_url_without_repo_mount(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     backend = KubernetesExecutorBackend()
@@ -1319,9 +1353,10 @@ async def test_create_mounts_repo_cache_pvc(
     backend._networking = fake_networking
 
     monkeypatch.setenv("AGENT_API_URL", "http://api.internal:8000")
+    monkeypatch.setenv("DATABASE_URL", "postgres://user:pass@db/centaur")
     monkeypatch.setenv("FIREWALL_HOST", "firewall.internal")
     monkeypatch.setenv("KUBERNETES_FIREWALL_CA_SECRET_NAME", "firewall-ca")
-    monkeypatch.setenv("REPOS_PVC_CLAIM_NAME", "centaur-repo-cache")
+    monkeypatch.setenv("CENTAUR_GIT_CACHE_URL", "http://repo-cache:8080/repos/")
     monkeypatch.setenv("KUBERNETES_NAMESPACE", "centaur-sandbox")
     monkeypatch.setattr(
         "api.sandbox.kubernetes._prompt_bundle",
@@ -1359,48 +1394,12 @@ async def test_create_mounts_repo_cache_pvc(
 
     pod_body = fake_core.created_pods[1][1]
     container = pod_body["spec"]["containers"][0]
+    env = {item["name"]: item["value"] for item in container["env"]}
 
-    assert any(
-        mount["name"] == "repos"
-        and mount["mountPath"] == "/home/agent/github"
-        and mount["readOnly"] is True
-        for mount in container["volumeMounts"]
-    )
-    assert {
-        "name": "repos",
-        "persistentVolumeClaim": {
-            "claimName": "centaur-repo-cache",
-            "readOnly": True,
-        },
-    } in pod_body["spec"]["volumes"]
-
-
-@pytest.mark.asyncio
-async def test_create_rejects_multiple_repo_cache_volume_sources(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    backend = KubernetesExecutorBackend()
-
-    monkeypatch.setenv("AGENT_API_URL", "http://api:8000")
-    monkeypatch.setenv("FIREWALL_HOST", "firewall")
-    monkeypatch.setenv("KUBERNETES_FIREWALL_CA_SECRET_NAME", "firewall-ca")
-    monkeypatch.setenv("REPOS_PATH", "/var/lib/centaur/repos")
-    monkeypatch.setenv("REPOS_PVC_CLAIM_NAME", "centaur-repo-cache")
-
-    async def fake_ensure_clients() -> None:
-        return None
-
-    monkeypatch.setattr(backend, "_ensure_clients", fake_ensure_clients)
-
-    with pytest.raises(
-        ValueError, match="Only one of REPOS_PATH or REPOS_PVC_CLAIM_NAME"
-    ):
-        await backend.create(
-            "slack:C123:123.456",
-            "amp",
-            "amp",
-            repo="paradigmxyz/centaur",
-        )
+    assert env["AGENT_REPO"] == "paradigmxyz/centaur"
+    assert env["CENTAUR_GIT_CACHE_URL"] == "http://repo-cache:8080/repos"
+    assert all(mount["name"] != "repos" for mount in container["volumeMounts"])
+    assert all(volume["name"] != "repos" for volume in pod_body["spec"]["volumes"])
 
 
 @pytest.mark.asyncio

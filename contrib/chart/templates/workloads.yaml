@@ -1,11 +1,8 @@
 {{- $reposPath := .Values.sandbox.reposPath -}}
-{{- $reposPvcClaimName := "" -}}
+{{- $gitCacheURL := "" -}}
 {{- $apiExtraEnv := .Values.api.extraEnv | default dict -}}
 {{- if and .Values.repoCache.enabled .Values.repoCache.persistence.enabled -}}
-{{- if $reposPath -}}
-{{- fail "sandbox.reposPath cannot be set when repoCache.persistence.enabled=true" -}}
-{{- end -}}
-{{- $reposPvcClaimName = include "centaur.repoCachePvcName" . -}}
+{{- $gitCacheURL = printf "http://%s:%v/repos" (include "centaur.componentName" (dict "root" . "component" "repo-cache")) .Values.repoCache.service.port -}}
 {{- else if and .Values.repoCache.enabled (not $reposPath) -}}
 {{- $reposPath = .Values.repoCache.hostPath -}}
 {{- end -}}
@@ -372,9 +369,9 @@ spec:
             - name: REPOS_PATH
               value: {{ $reposPath | quote }}
 {{- end }}
-{{- if $reposPvcClaimName }}
-            - name: REPOS_PVC_CLAIM_NAME
-              value: {{ $reposPvcClaimName | quote }}
+{{- if $gitCacheURL }}
+            - name: CENTAUR_GIT_CACHE_URL
+              value: {{ $gitCacheURL | quote }}
 {{- end }}
 {{- with .Values.sandbox.extraEnv }}
 {{- $envList := list }}

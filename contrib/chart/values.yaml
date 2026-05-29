@@ -151,9 +151,11 @@ sandbox:
 
 repoCache:
   enabled: false
-  # hostPath is kept for local/dev clusters. Production clusters should prefer
-  # persistence.enabled so sandboxes mount a PVC instead of a node filesystem path.
+  # hostPath is the legacy/local mode. With persistence enabled, repo-cache
+  # serves PVC-backed bare Git mirrors over HTTP and sandboxes do not mount it.
   hostPath: /var/lib/centaur/repos
+  service:
+    port: 8080
   persistence:
     enabled: false
     existingClaim: ""
