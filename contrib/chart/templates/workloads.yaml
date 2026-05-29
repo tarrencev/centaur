@@ -2,7 +2,7 @@
 {{- $gitCacheURL := "" -}}
 {{- $repoCacheMode := include "centaur.repoCacheMode" . -}}
 {{- $apiExtraEnv := .Values.api.extraEnv | default dict -}}
-{{- if and .Values.repoCache.enabled (eq $repoCacheMode "gitMirror") -}}
+{{- if and .Values.repoCache.enabled (eq $repoCacheMode "mirror") -}}
 {{- $gitCacheURL = printf "http://%s:%v/repos" (include "centaur.componentName" (dict "root" . "component" "repo-cache")) .Values.repoCache.service.port -}}
 {{- else if and .Values.repoCache.enabled (eq $repoCacheMode "hostPath") (not $reposPath) -}}
 {{- $reposPath = .Values.repoCache.hostPath -}}

@@ -1,9 +1,11 @@
 {{- $repoCacheMode := include "centaur.repoCacheMode" . -}}
-{{- if and .Values.repoCache.enabled (eq $repoCacheMode "gitMirror") }}
+{{- if and .Values.repoCache.enabled (eq $repoCacheMode "mirror") }}
+# mirror mode: sandboxes use an in-cluster HTTP Git cache instead of mounting storage.
 {{- $repoCacheImageRepository := default .Values.sandbox.image.repository .Values.repoCache.image.repository -}}
 {{- $repoCacheImageTag := default .Values.sandbox.image.tag .Values.repoCache.image.tag -}}
 {{- $repoCacheImagePullPolicy := default .Values.sandbox.image.pullPolicy .Values.repoCache.image.pullPolicy -}}
 {{- if not .Values.repoCache.persistence.existingClaim }}
+# Persistent storage for bare repository mirrors.
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -21,6 +23,7 @@ spec:
       storage: {{ .Values.repoCache.persistence.size }}
 ---
 {{- end }}
+# Stable HTTP endpoint used by Git URL rewrites inside sandbox images.
 apiVersion: v1
 kind: Service
 metadata:
@@ -35,6 +38,7 @@ spec:
       port: {{ .Values.repoCache.service.port }}
       targetPort: git-http
 ---
+# Single mirror server that lazily fetches repositories and serves Git smart HTTP.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -69,6 +73,7 @@ spec:
 {{ toYaml . | nindent 8 }}
 {{- end }}
       containers:
+        # Egress goes through iron-proxy so GitHub credentials stay out of sandboxes.
         - name: repo-cache
           image: {{ printf "%s:%s" $repoCacheImageRepository $repoCacheImageTag | quote }}
           imagePullPolicy: {{ $repoCacheImagePullPolicy }}

@@ -151,13 +151,13 @@ sandbox:
 
 repoCache:
   enabled: false
-  # hostPath keeps the legacy per-node shared clone cache. gitMirror serves
-  # PVC-backed bare Git mirrors over HTTP and sandboxes do not mount the cache.
-  mode: hostPath # hostPath | gitMirror
+  # Select how sandboxes get faster Git checkouts.
+  # hostPath mounts a per-node cache; mirror serves a PVC-backed HTTP Git cache.
+  mode: hostPath # hostPath | mirror
   hostPath: /var/lib/centaur/repos
   service:
     port: 8080
-  # Used by mode=gitMirror. The hostPath mode always uses repoCache.hostPath.
+  # PVC settings used only by mode=mirror.
   persistence:
     existingClaim: ""
     size: 20Gi

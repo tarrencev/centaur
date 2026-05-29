@@ -299,6 +299,7 @@ spec:
 ---
 {{- end }}
 {{- if .Values.repoCache.enabled }}
+# Repo-cache traffic differs by mode: mirror accepts sandbox HTTP; hostPath only syncs out.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -310,11 +311,11 @@ spec:
     matchLabels:
 {{ include "centaur.componentSelectorLabels" (dict "root" . "component" "repo-cache") | nindent 6 }}
   policyTypes:
-{{- if eq $repoCacheMode "gitMirror" }}
+{{- if eq $repoCacheMode "mirror" }}
     - Ingress
 {{- end }}
     - Egress
-{{- if eq $repoCacheMode "gitMirror" }}
+{{- if eq $repoCacheMode "mirror" }}
   ingress:
     - from:
         - podSelector:
@@ -325,7 +326,7 @@ spec:
           port: {{ .Values.repoCache.service.port }}
 {{- end }}
   egress:
-{{- if eq $repoCacheMode "gitMirror" }}
+{{- if eq $repoCacheMode "mirror" }}
     - to:
         - podSelector:
             matchLabels:
@@ -414,7 +415,8 @@ spec:
       ports:
         - protocol: TCP
           port: 8000
-{{- if and .Values.repoCache.enabled (eq $repoCacheMode "gitMirror") }}
+{{- if and .Values.repoCache.enabled (eq $repoCacheMode "mirror") }}
+    # Sandboxes only need repo-cache access in mirror mode; hostPath mounts no service.
     - to:
         - podSelector:
             matchLabels:

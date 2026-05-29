@@ -103,7 +103,7 @@
         "enabled": { "type": "boolean" },
         "mode": {
           "type": "string",
-          "enum": ["hostPath", "gitMirror"]
+          "enum": ["hostPath", "mirror"]
         },
         "hostPath": { "type": "string" },
         "service": {
