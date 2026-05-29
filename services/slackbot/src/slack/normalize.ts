@@ -97,17 +97,22 @@ export async function normalizeSlackEnvelope(opts: {
   const isMention =
     event.type === 'app_mention' ||
     Boolean(opts.botUserId && messageMentionsBot(event, opts.botUserId))
-  const historyMessages = isMention
-    ? await collectThreadHistorySafely({
-        client: opts.client,
-        channel: event.channel,
-        threadTs,
-        currentTs: event.ts,
-        teamId,
-        botUserId: opts.botUserId,
-        botId: opts.botId
-      })
-    : []
+  const isThreadReply = Boolean(event.thread_ts && event.thread_ts !== event.ts)
+  const historyMessages =
+    isMention || isThreadReply
+      ? await collectThreadHistorySafely({
+          client: opts.client,
+          channel: event.channel,
+          threadTs,
+          currentTs: event.ts,
+          teamId,
+          botUserId: opts.botUserId,
+          botId: opts.botId
+        })
+      : []
+  const isExistingCentaurThread =
+    isThreadReply && historyMessages.some(message => historyMessageBelongsToCentaur(message))
+  const isActionable = isMention || isExistingCentaurThread
 
   return {
     thread_key: `slack:${teamId}:${event.channel}:${threadTs}`,
@@ -118,6 +123,7 @@ export async function normalizeSlackEnvelope(opts: {
     channel_id: event.channel,
     thread_ts: threadTs,
     is_mention: isMention,
+    is_actionable: isActionable,
     parts,
     ...(historyMessages.length ? { history_messages: historyMessages } : {}),
     slack: {
@@ -208,7 +214,11 @@ async function collectThreadHistory(opts: {
         role,
         parts,
         user_id: actorId,
-        metadata: { platform: 'slack', history_backfill: true }
+        metadata: {
+          platform: 'slack',
+          history_backfill: true,
+          ...(messageMentionsBot(message, opts.botUserId) ? { mentions_bot: true } : {})
+        }
       })
     }
 
@@ -217,6 +227,10 @@ async function collectThreadHistory(opts: {
   } while (cursor)
 
   return history
+}
+
+function historyMessageBelongsToCentaur(message: SlackHistoryMessage): boolean {
+  return message.role === 'assistant' || message.metadata?.mentions_bot === true
 }
 
 async function partsFromSlackMessage(
@@ -245,11 +259,10 @@ function slackMessageText(
   ]).join('\n\n')
 }
 
-function messageMentionsBot(
-  message: Pick<SlackMessageEvent, 'text'>,
-  botUserId: string
-): boolean {
-  return typeof message.text === 'string' && message.text.includes(`<@${botUserId}>`)
+function messageMentionsBot(message: Pick<SlackMessageEvent, 'text'>, botUserId?: string): boolean {
+  return Boolean(
+    botUserId && typeof message.text === 'string' && message.text.includes(`<@${botUserId}>`)
+  )
 }
 
 function slackActorId(

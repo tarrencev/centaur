@@ -583,9 +583,10 @@ async function processSlackEvent(envelope: SlackEnvelope): Promise<void> {
         'slack.thread_ts': normalized.thread_ts,
         'slack.user_id': normalized.user_id,
         'centaur.slackbot.is_mention': normalized.is_mention,
+        'centaur.slackbot.is_actionable': normalized.is_actionable ?? normalized.is_mention,
         'centaur.slackbot.part_count': normalized.parts.length
       })
-      if (!normalized.is_mention) {
+      if (!(normalized.is_actionable ?? normalized.is_mention)) {
         spanAttributes(span, {
           'centaur.slackbot.event_ignored': true,
           'centaur.slackbot.ignore_reason': 'not_mention'
