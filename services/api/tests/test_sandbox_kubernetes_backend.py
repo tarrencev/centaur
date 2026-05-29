@@ -261,6 +261,7 @@ def test_container_env_includes_firewall_host_for_secret_bootstrap(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("AGENT_API_URL", "http://api.internal:8000")
+    monkeypatch.setenv("CENTAUR_GIT_CACHE_URL", "http://repo-cache:8080/repos/")
 
     env = sandbox_container_env(
         "thread-key",
@@ -284,6 +285,7 @@ def test_container_env_includes_firewall_host_for_secret_bootstrap(
         "victorialogs",
         "api.internal",
     ]
+    assert "repo-cache" in no_proxy_hosts
     assert env_map["no_proxy"] == env_map["NO_PROXY"]
 
 

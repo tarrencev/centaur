@@ -135,3 +135,34 @@ def test_sandbox_entrypoint_installs_codex_harness_config(tmp_path: Path) -> Non
 
     assert result.returncode == 0, result.stderr or result.stdout
     assert result.stdout == (harness_dir / "codex" / "config.toml").read_text()
+
+
+def test_sandbox_entrypoint_installs_git_cache_rewrites(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    harness_dir = _write_codex_harness_config(home)
+
+    result = subprocess.run(
+        [
+            "bash",
+            str(ENTRYPOINT_SH),
+            "sh",
+            "-lc",
+            "git config --global --get-all url.http://repo-cache:8080/repos/github.com/.insteadOf",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env={
+            "HOME": str(home),
+            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+            "CENTAUR_GIT_CACHE_URL": "http://repo-cache:8080/repos/",
+            "CENTAUR_HARNESS_CONFIG_DIR": str(harness_dir),
+        },
+    )
+
+    assert result.returncode == 0, result.stderr or result.stdout
+    assert result.stdout.splitlines() == [
+        "https://github.com/",
+        "git@github.com:",
+        "ssh://git@github.com/",
+    ]
