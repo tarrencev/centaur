@@ -151,13 +151,6 @@ if [ "${CENTAUR_PERSISTENT_STATE:-0}" = "1" ]; then
 else
     WORKSPACE_DIR="$HOME_DIR/workspace"
 fi
-if [ -n "${CENTAUR_GIT_CACHE_URL:-}" ]; then
-    CACHE_GITHUB_PREFIX="${CENTAUR_GIT_CACHE_URL%/}/github.com/"
-    /usr/bin/git config --global --unset-all "url.${CACHE_GITHUB_PREFIX}.insteadOf" 2>/dev/null || true
-    /usr/bin/git config --global --add "url.${CACHE_GITHUB_PREFIX}.insteadOf" "https://github.com/"
-    /usr/bin/git config --global --add "url.${CACHE_GITHUB_PREFIX}.insteadOf" "git@github.com:"
-    /usr/bin/git config --global --add "url.${CACHE_GITHUB_PREFIX}.insteadOf" "ssh://git@github.com/"
-fi
 if [ -n "${AGENT_REPO:-}" ]; then
     REPO_PATH="$HOME_DIR/github/$AGENT_REPO"
     REPO_URL="https://github.com/${AGENT_REPO}.git"
