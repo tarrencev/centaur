@@ -1,5 +1,6 @@
 {{- if .Values.networkPolicy.enabled }}
 {{- $ingressSourceNamespaces := default .Values.networkPolicy.ingressControllerNamespaces .Values.networkPolicy.ingressSourceNamespaces }}
+{{- $repoCacheMode := include "centaur.repoCacheMode" . }}
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -310,6 +311,7 @@ spec:
 ---
 {{- end }}
 {{- if .Values.repoCache.enabled }}
+# Repo-cache traffic differs by mode: mirror accepts sandbox HTTP; hostPath only syncs out.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -321,12 +323,36 @@ spec:
     matchLabels:
 {{ include "centaur.componentSelectorLabels" (dict "root" . "component" "repo-cache") | nindent 6 }}
   policyTypes:
+{{- if eq $repoCacheMode "mirror" }}
+    - Ingress
+{{- end }}
     - Egress
+{{- if eq $repoCacheMode "mirror" }}
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              centaur.ai/managed: "true"
+      ports:
+        - protocol: TCP
+          port: {{ .Values.repoCache.service.port }}
+{{- end }}
   egress:
+{{- if eq $repoCacheMode "mirror" }}
+    - to:
+        - podSelector:
+            matchLabels:
+              centaur.ai/iron-proxy: "true"
+              centaur.ai/sandbox-id: api
+      ports:
+        - protocol: TCP
+          port: {{ .Values.ironProxy.service.proxyPort }}
+{{- else }}
 {{- range .Values.repoCache.egressPorts }}
     - ports:
         - protocol: TCP
           port: {{ . }}
+{{- end }}
 {{- end }}
 ---
 {{- end }}
@@ -401,4 +427,14 @@ spec:
       ports:
         - protocol: TCP
           port: 8000
+{{- if and .Values.repoCache.enabled (eq $repoCacheMode "mirror") }}
+    # Sandboxes only need repo-cache access in mirror mode; hostPath mounts no service.
+    - to:
+        - podSelector:
+            matchLabels:
+{{ include "centaur.componentSelectorLabels" (dict "root" . "component" "repo-cache") | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.repoCache.service.port }}
+{{- end }}
 {{- end }}

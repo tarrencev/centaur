@@ -192,6 +192,8 @@ COPY --link --chmod=755 services/sandbox/codex-app-wrapper.py /usr/local/bin/cod
 COPY --link --chmod=755 services/sandbox/claude-app-wrapper.py /usr/local/bin/claude-app-wrapper
 COPY --link --chmod=755 services/sandbox/harness_adapter.py /usr/local/bin/harness-adapter
 COPY --link --chmod=755 services/sandbox/git-branch.sh /usr/local/bin/git-branch
+COPY --link --chmod=755 services/sandbox/git-cache-wrapper.sh /usr/local/bin/git
+COPY --link --chmod=755 services/sandbox/repo-cache-server.py /usr/local/bin/repo-cache-server
 COPY --link --chmod=755 services/sandbox/entrypoint.sh /entrypoint.sh
 
 USER agent
