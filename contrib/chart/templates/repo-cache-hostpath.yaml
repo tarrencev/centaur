@@ -1,13 +1,11 @@
 {{- $repoCacheMode := include "centaur.repoCacheMode" . -}}
 {{- if and .Values.repoCache.enabled (eq $repoCacheMode "hostPath") }}
-# hostPath mode: one DaemonSet pod per node maintains working clones on node disk.
 {{- if not .Values.repoCache.repositories }}
 {{- fail "repoCache.repositories must contain at least one owner/repo entry when repoCache.mode=hostPath" }}
 {{- end }}
 {{- $repoCacheImageRepository := default .Values.sandbox.image.repository .Values.repoCache.image.repository -}}
 {{- $repoCacheImageTag := default .Values.sandbox.image.tag .Values.repoCache.image.tag -}}
 {{- $repoCacheImagePullPolicy := default .Values.sandbox.image.pullPolicy .Values.repoCache.image.pullPolicy -}}
-# Sync loop for the legacy node-local repository cache.
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
@@ -41,7 +39,6 @@ spec:
 {{ toYaml . | nindent 8 }}
 {{- end }}
       containers:
-        # Periodically clones or fetches the configured repositories into /cache.
         - name: repo-cache
           image: {{ printf "%s:%s" $repoCacheImageRepository $repoCacheImageTag | quote }}
           imagePullPolicy: {{ $repoCacheImagePullPolicy }}
