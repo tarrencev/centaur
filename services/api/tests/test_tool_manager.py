@@ -1,5 +1,6 @@
 """Unit tests for pure functions in api.tool_manager."""
 
+import shutil
 import sys
 from dataclasses import dataclass
 from enum import Enum
@@ -507,6 +508,31 @@ def test_discover_loads_fake_tools_with_shadowing_personas_and_failures(tmp_path
     assert persona.prompt_content == "Persona prompt body"
     assert persona.has_custom_executor is True
     assert "code-reviewer" not in manager.tools
+
+
+def test_discover_loads_mercury_and_typefully_without_runtime_secrets(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from centaur_sdk.backends import registry
+
+    monkeypatch.setattr(registry, "_backend", _NullBackend())
+    repo_root = Path(__file__).resolve().parents[3]
+    tools_dir = tmp_path / "tools"
+    shutil.copytree(
+        repo_root / "tools" / "business" / "mercury",
+        tools_dir / "business" / "mercury",
+    )
+    shutil.copytree(
+        repo_root / "tools" / "comms" / "typefully",
+        tools_dir / "comms" / "typefully",
+    )
+
+    manager = ToolManager(tools_dir)
+    loaded = manager.discover()
+
+    assert {"mercury", "typefully"}.issubset({tool.name for tool in loaded})
+    assert manager.load_failures == []
 
 
 @pytest.mark.asyncio

@@ -40,22 +40,37 @@ class MercuryClient:
         base_url: str | None = None,
         timeout: float = 30.0,
     ):
-        self.api_key = _clean(api_key) or _clean(secret("MERCURY_API_KEY", ""))
-        if not self.api_key:
-            raise RuntimeError("MERCURY_API_KEY not set.")
+        self._api_key = _clean(api_key)
+        self._base_url = _clean(base_url)
+        self._timeout = timeout
+        self._client: httpx.Client | None = None
 
-        configured_base = _clean(base_url) or _clean(secret("MERCURY_API_BASE_URL", ""))
+    @property
+    def api_key(self) -> str:
+        api_key = self._api_key or _clean(secret("MERCURY_API_KEY", ""))
+        if not api_key:
+            raise RuntimeError("MERCURY_API_KEY not set.")
+        return api_key
+
+    @property
+    def base_url(self) -> str:
+        configured_base = self._base_url or _clean(secret("MERCURY_API_BASE_URL", ""))
         if not configured_base or configured_base == "MERCURY_API_BASE_URL":
             configured_base = DEFAULT_BASE_URL
-        self.base_url = configured_base.rstrip("/")
-        self._client = httpx.Client(
-            base_url=self.base_url,
-            timeout=timeout,
-            headers={
-                "Authorization": f"Bearer {self.api_key}",
-                "Accept": "application/json",
-            },
-        )
+        return configured_base.rstrip("/")
+
+    @property
+    def _http(self) -> httpx.Client:
+        if self._client is None:
+            self._client = httpx.Client(
+                base_url=self.base_url,
+                timeout=self._timeout,
+                headers={
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Accept": "application/json",
+                },
+            )
+        return self._client
 
     def _request(
         self,
@@ -68,7 +83,7 @@ class MercuryClient:
         data: dict[str, Any] | None = None,
         binary: bool = False,
     ) -> Any:
-        response = self._client.request(
+        response = self._http.request(
             method,
             path,
             params=params,
@@ -721,7 +736,9 @@ class MercuryClient:
 
     def close(self) -> None:
         """Close the HTTP client."""
-        self._client.close()
+        if self._client is not None:
+            self._client.close()
+            self._client = None
 
     def __enter__(self) -> MercuryClient:
         return self

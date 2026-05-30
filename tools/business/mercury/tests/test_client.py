@@ -26,7 +26,7 @@ def _load_module():
 
 
 def _mock_client(client, handler) -> None:
-    client._client.close()
+    client.close()
     client._client = httpx.Client(
         base_url=client.base_url,
         headers={"Authorization": f"Bearer {client.api_key}", "Accept": "application/json"},
@@ -54,6 +54,35 @@ def test_factory_uses_secret_and_base_url_override() -> None:
             client.close()
     finally:
         reset_tool_context(token)
+
+
+def test_factory_does_not_require_secret_until_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from centaur_sdk.backends import registry
+
+    class NullBackend:
+        async def get(self, key: str) -> str | None:
+            return None
+
+        async def list_keys(self) -> list[str]:
+            return []
+
+        def get_sync(self, key: str) -> str | None:
+            return None
+
+    monkeypatch.setattr(registry, "_backend", NullBackend())
+    monkeypatch.delenv("MERCURY_API_KEY", raising=False)
+    monkeypatch.delenv("MERCURY_API_BASE_URL", raising=False)
+    module = _load_module()
+
+    client = module._client()
+    try:
+        assert client.base_url == module.DEFAULT_BASE_URL
+        with pytest.raises(RuntimeError, match="MERCURY_API_KEY not set"):
+            client.get_accounts()
+    finally:
+        client.close()
 
 
 def test_get_accounts_sends_bearer_auth_and_pagination_params() -> None:
