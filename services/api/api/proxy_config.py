@@ -511,7 +511,13 @@ def render_proxy_yaml(
 
     listeners = _build_postgres_listeners(secrets, pg_listen_ports)
     if core_pg is not None:
-        listeners.append(_build_core_pg_listener(**core_pg))
+        listeners.append(
+            _build_core_pg_listener(
+                port=core_pg["port"],
+                dsn_env_var=core_pg["dsn_env_var"],
+                password_env=core_pg["password_env"],
+            )
+        )
     if listeners:
         cfg["postgres"] = listeners
     else:

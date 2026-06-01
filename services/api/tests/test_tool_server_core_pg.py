@@ -6,6 +6,7 @@ import pytest
 
 from api.proxy_config import PG_LISTEN_PORT_BASE
 from api.sandbox.kubernetes import (
+    _CORE_PG_DSN_ENV,
     _CORE_PG_PASSWORD_ENV,
     _build_core_pg,
     _build_tool_server_container,
@@ -13,7 +14,9 @@ from api.sandbox.kubernetes import (
 )
 
 
-def test_build_core_pg_points_at_proxy_listener(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_build_core_pg_points_at_proxy_listener(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@db:5432/ai_v2")
     monkeypatch.delenv("KUBERNETES_SECRET_ENV_PREFIX", raising=False)
 
@@ -40,6 +43,29 @@ def test_build_core_pg_respects_secret_env_prefix(
 
     assert core["dsn_env_var"] == "CENTAUR_DATABASE_URL"
     assert core["port"] == PG_LISTEN_PORT_BASE  # no tool listeners
+
+
+def test_build_core_pg_can_use_operator_database_url_template(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DATABASE_URL", "postgresql://u:p@db:5432/ai_v2")
+    monkeypatch.setenv(
+        "KUBERNETES_CORE_DATABASE_URL",
+        "postgresql://centaur:$(DB_PASSWORD)@postgres:5432/ai_v2",
+    )
+    monkeypatch.setenv(
+        "KUBERNETES_CORE_DATABASE_URL_PASSWORD_SECRET_KEY", "DB_PASSWORD"
+    )
+
+    core = _build_core_pg("proxy-host", {})
+
+    assert core["dsn_env_var"] == _CORE_PG_DSN_ENV
+    assert (
+        core["dsn_env_value"]
+        == "postgresql://centaur:$(DB_PASSWORD)@postgres:5432/ai_v2"
+    )
+    assert core["dsn_password_env"] == "DB_PASSWORD"
+    assert core["dsn_password_secret_key"] == "DB_PASSWORD"
 
 
 def test_tool_server_container_uses_proxied_dsn_value(
@@ -102,6 +128,36 @@ def test_proxy_iron_env_includes_core_password_when_set(
 
     values = {e["name"]: e.get("value") for e in env}
     assert values[_CORE_PG_PASSWORD_ENV] == "sekret"
+
+
+def test_proxy_iron_env_includes_core_upstream_dsn_template(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("KUBERNETES_SECRET_ENV_NAME", "centaur-infra-env")
+    core = {
+        "password_env": _CORE_PG_PASSWORD_ENV,
+        "password": "sekret",
+        "dsn_env_var": _CORE_PG_DSN_ENV,
+        "dsn_env_value": "postgresql://centaur:$(DB_PASSWORD)@postgres:5432/ai_v2",
+        "dsn_password_env": "DB_PASSWORD",
+        "dsn_password_secret_key": "DB_PASSWORD",
+    }
+
+    env = _proxy_iron_env("centaur-infra-env", [], core=core)
+    names = [e["name"] for e in env]
+
+    assert names.index("DB_PASSWORD") < names.index(_CORE_PG_DSN_ENV)
+    by_name = {e["name"]: e for e in env}
+    assert by_name["DB_PASSWORD"] == {
+        "name": "DB_PASSWORD",
+        "valueFrom": {
+            "secretKeyRef": {"name": "centaur-infra-env", "key": "DB_PASSWORD"}
+        },
+    }
+    assert by_name[_CORE_PG_DSN_ENV] == {
+        "name": _CORE_PG_DSN_ENV,
+        "value": "postgresql://centaur:$(DB_PASSWORD)@postgres:5432/ai_v2",
+    }
 
 
 def test_proxy_iron_env_omits_core_password_when_none(

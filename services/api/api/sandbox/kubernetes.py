@@ -69,6 +69,7 @@ _API_PROXY_SANDBOX_ID = "api"
 # Helm upgrade. The label keeps the chart-side NetworkPolicy selector
 # wired up.
 _TOKEN_BROKER_LABEL = "centaur.ai/iron-token-broker"
+
 def _get_rt(session: SandboxSession):
     return runtime_for_session(session)
 
@@ -320,6 +321,20 @@ def _proxy_iron_env(
             {"name": f"PG_PROXY_PASSWORD_{secret.name}", "value": proxy_password}
         )
     if core is not None:
+        if core.get("dsn_password_env") and core.get("dsn_password_secret_key"):
+            env.append(
+                {
+                    "name": core["dsn_password_env"],
+                    "valueFrom": {
+                        "secretKeyRef": {
+                            "name": secret_name,
+                            "key": core["dsn_password_secret_key"],
+                        }
+                    },
+                }
+            )
+        if core.get("dsn_env_value"):
+            env.append({"name": core["dsn_env_var"], "value": core["dsn_env_value"]})
         env.append({"name": core["password_env"], "value": core["password"]})
     return env
 
@@ -336,6 +351,9 @@ def _build_proxied_pg_url(host: str, port: int, password: str, database: str) ->
 
 
 _CORE_PG_PASSWORD_ENV = "PG_PROXY_PASSWORD_CENTAUR_CORE"
+_CORE_PG_DSN_ENV = "CENTAUR_CORE_DATABASE_URL"
+_CORE_PG_DSN_TEMPLATE_ENV = "KUBERNETES_CORE_DATABASE_URL"
+_CORE_PG_DSN_PASSWORD_KEY_ENV = "KUBERNETES_CORE_DATABASE_URL_PASSWORD_SECRET_KEY"
 
 
 def _core_db_name() -> str:
@@ -362,13 +380,22 @@ def _build_core_pg(
     """
     port = core_pg_listen_port(pg_listen_ports)
     password = _secrets.token_urlsafe(24)
-    return {
+    core = {
         "port": port,
         "password": password,
         "password_env": _CORE_PG_PASSWORD_ENV,
         "dsn_env_var": _secret_env_key("DATABASE_URL"),
         "dsn": _build_proxied_pg_url(firewall_host, port, password, _core_db_name()),
     }
+    dsn_template = (os.getenv(_CORE_PG_DSN_TEMPLATE_ENV) or "").strip()
+    if dsn_template:
+        core["dsn_env_var"] = _CORE_PG_DSN_ENV
+        core["dsn_env_value"] = dsn_template
+        password_key = (os.getenv(_CORE_PG_DSN_PASSWORD_KEY_ENV) or "").strip()
+        if password_key:
+            core["dsn_password_env"] = password_key
+            core["dsn_password_secret_key"] = _secret_env_key(password_key)
+    return core
 
 
 def _api_pod_match_labels() -> dict[str, str]:
