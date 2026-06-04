@@ -18,6 +18,7 @@ from api.tool_manager import (  # noqa: E402
     _describe_method_docstring,
     _friendly_type_name,
     _normalize_for_serialization,
+    _parse_tool_name_set,
     _tool_arg_validation_error,
     _to_toon,
     ToolManager,
@@ -508,6 +509,46 @@ def test_discover_loads_fake_tools_with_shadowing_personas_and_failures(tmp_path
     assert persona.prompt_content == "Persona prompt body"
     assert persona.has_custom_executor is True
     assert "code-reviewer" not in manager.tools
+
+
+def test_parse_tool_name_set_accepts_commas_and_whitespace():
+    assert _parse_tool_name_set(" slack,websearch\nposthog\tfal_ai ,, ") == {
+        "fal_ai",
+        "posthog",
+        "slack",
+        "websearch",
+    }
+
+
+def test_discover_applies_tool_allowlist_before_loading(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    base_tools = tmp_path / "base"
+    overlay_tools = tmp_path / "overlay"
+
+    _write_tool(base_tools, "alpha", FAKE_TOOL_CLIENT, description="Base alpha")
+    _write_tool(base_tools, "beta", FAKE_TOOL_CLIENT, description="Base beta")
+    _write_tool(
+        overlay_tools,
+        "alpha",
+        OVERLAY_TOOL_CLIENT,
+        description="Overlay alpha",
+        secrets=["REQ_TOKEN"],
+    )
+    _write_tool(overlay_tools, "gamma", FAKE_TOOL_CLIENT, description="Overlay gamma")
+    _write_persona(overlay_tools, "code-reviewer")
+
+    monkeypatch.setenv("TOOL_ALLOWLIST", "alpha, gamma")
+    manager = ToolManager([base_tools, overlay_tools])
+    loaded = manager.discover()
+
+    assert [tool.name for tool in loaded] == ["alpha", "gamma"]
+    assert set(manager.tools) == {"alpha", "gamma"}
+    assert manager.tools["alpha"].description == "Overlay alpha"
+    assert [secret.name for secret in manager.tools["alpha"].secrets] == ["REQ_TOKEN"]
+    assert "beta" not in manager.tools
+    assert manager.get_persona("code-reviewer") is not None
 
 
 def test_discover_loads_mercury_and_typefully_without_runtime_secrets(

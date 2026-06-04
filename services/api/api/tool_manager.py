@@ -1606,6 +1606,18 @@ def load_plugins_config(config_path: Path) -> list[Path]:
     return dirs
 
 
+def _parse_tool_name_set(raw: str | None) -> set[str]:
+    """Parse comma/newline-separated tool names from an operator env var."""
+    if not raw:
+        return set()
+    names: set[str] = set()
+    for part in re.split(r"[\s,]+", raw):
+        name = part.strip()
+        if name:
+            names.add(name)
+    return names
+
+
 class ToolManager:
     def __init__(
         self,
@@ -1619,6 +1631,7 @@ class ToolManager:
         self.personas: dict[str, LoadedPersona] = {}
         self.load_failures: list[dict[str, str]] = []
         self._reload_lock = threading.Lock()
+        self._tool_allowlist = _parse_tool_name_set(os.getenv("TOOL_ALLOWLIST"))
 
     def _collect_tools(self) -> list[tuple[Path, dict]]:
         """Read pyproject.toml from each tool dir.
@@ -1661,6 +1674,8 @@ class ToolManager:
                 tool_conf = pyproject.get("tool", {}).get("centaur", {})
 
                 name = tool_dir.name
+                if self._tool_allowlist and name not in self._tool_allowlist:
+                    continue
                 # Tool-level ``hosts`` is the legacy fallback for secret entries
                 # that do not carry their own; each secret should declare its.
                 default_hosts = tuple(tool_conf.get("hosts", []))

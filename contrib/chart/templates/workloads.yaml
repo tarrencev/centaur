@@ -193,17 +193,21 @@ spec:
               value: info
             - name: CENTAUR_DEFAULT_HARNESS
               value: {{ .Values.api.defaultHarness | quote }}
+{{- if not (hasKey $apiExtraEnv "TOOL_DIRS") }}
             - name: TOOL_DIRS
 {{- if .Values.overlay.image.repository }}
               value: {{ printf "/app/tools:%s/tools" .Values.overlay.mountPath | quote }}
 {{- else }}
               value: /app/tools
 {{- end }}
+{{- end }}
+{{- if not (hasKey $apiExtraEnv "WORKFLOW_DIRS") }}
             - name: WORKFLOW_DIRS
 {{- if .Values.overlay.image.repository }}
               value: {{ printf "/app/workflows:%s/workflows" .Values.overlay.mountPath | quote }}
 {{- else }}
               value: /app/workflows
+{{- end }}
 {{- end }}
 {{- if or .Values.overlay.systemPrompt .Values.overlay.image.repository }}
             - name: CENTAUR_OVERLAY_DIR
