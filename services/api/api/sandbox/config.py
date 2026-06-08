@@ -67,6 +67,12 @@ _PINNED_PROXY_ENV_KEYS = frozenset(
 _NO_PROXY_ENV_KEYS = frozenset({"NO_PROXY", "no_proxy"})
 
 OBSERVABILITY_NO_PROXY_HOSTS = ("victoriametrics", "victorialogs")
+KUBERNETES_API_NO_PROXY_HOSTS = (
+    "kubernetes",
+    "kubernetes.default",
+    "kubernetes.default.svc",
+    "kubernetes.default.svc.cluster.local",
+)
 
 
 def _set_env(env: list[str], name: str, value: str) -> None:
@@ -210,8 +216,12 @@ def container_env(
         "localhost",
         "127.0.0.1",
         firewall_host,
+        *KUBERNETES_API_NO_PROXY_HOSTS,
         *OBSERVABILITY_NO_PROXY_HOSTS,
     ]
+    kubernetes_service_host = (os.getenv("KUBERNETES_SERVICE_HOST") or "").strip()
+    if kubernetes_service_host:
+        no_proxy_hosts.append(kubernetes_service_host)
     api_host = urlsplit(api_url).hostname
     if api_host:
         no_proxy_hosts.append(api_host)

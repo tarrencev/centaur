@@ -427,6 +427,12 @@ spec:
       ports:
         - protocol: TCP
           port: 8000
+    # Optional kubectl access from sandboxes with a mounted service-account
+    # token. The kubernetes.default ClusterIP (:443) is DNAT'd to the real
+    # endpoint port (6443 on k3s/kubeadm); enforcing CNIs match post-DNAT.
+    - ports:
+        - protocol: TCP
+          port: {{ .Values.networkPolicy.apiServerPort }}
 {{- if and .Values.repoCache.enabled (eq $repoCacheMode "mirror") }}
     # Sandboxes only need repo-cache access in mirror mode; hostPath mounts no service.
     - to:

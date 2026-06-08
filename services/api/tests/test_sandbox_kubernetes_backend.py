@@ -262,6 +262,7 @@ def test_container_env_includes_firewall_host_for_secret_bootstrap(
 ) -> None:
     monkeypatch.setenv("AGENT_API_URL", "http://api.internal:8000")
     monkeypatch.setenv("CENTAUR_GIT_CACHE_URL", "http://repo-cache:8080/repos/")
+    monkeypatch.setenv("KUBERNETES_SERVICE_HOST", "10.96.0.1")
 
     env = sandbox_container_env(
         "thread-key",
@@ -277,16 +278,43 @@ def test_container_env_includes_firewall_host_for_secret_bootstrap(
     assert env_map["OPENAI_API_KEY"] == "OPENAI_API_KEY"
     assert env_map["CENTAUR_TRACE_ID"] == "00000000-0000-0000-0000-000000000123"
     no_proxy_hosts = env_map["NO_PROXY"].split(",")
-    assert no_proxy_hosts[:6] == [
+    assert no_proxy_hosts[:10] == [
         "localhost",
         "127.0.0.1",
         "firewall.internal",
+        "kubernetes",
+        "kubernetes.default",
+        "kubernetes.default.svc",
+        "kubernetes.default.svc.cluster.local",
         "victoriametrics",
         "victorialogs",
-        "api.internal",
+        "10.96.0.1",
     ]
+    assert "api.internal" in no_proxy_hosts
     assert "repo-cache" in no_proxy_hosts
     assert env_map["no_proxy"] == env_map["NO_PROXY"]
+
+
+def test_container_env_includes_kubernetes_api_no_proxy_hosts() -> None:
+    env = sandbox_container_env("thread-key", "sandbox-id", "firewall.internal")
+    env_map = dict(item.split("=", 1) for item in env)
+    no_proxy_hosts = env_map["NO_PROXY"].split(",")
+
+    assert "kubernetes" in no_proxy_hosts
+    assert "kubernetes.default" in no_proxy_hosts
+    assert "kubernetes.default.svc" in no_proxy_hosts
+    assert "kubernetes.default.svc.cluster.local" in no_proxy_hosts
+
+
+def test_container_env_includes_kubernetes_service_host_in_no_proxy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("KUBERNETES_SERVICE_HOST", "10.96.0.1")
+    env = sandbox_container_env("thread-key", "sandbox-id", "firewall.internal")
+    env_map = dict(item.split("=", 1) for item in env)
+    no_proxy_hosts = env_map["NO_PROXY"].split(",")
+
+    assert "10.96.0.1" in no_proxy_hosts
 
 
 def test_container_env_passes_allowed_otel_config(
@@ -641,6 +669,7 @@ def test_tool_server_container_has_verifiable_api_key(
     assert claims["thread_key"] == "slack:C123:123.456"
     assert claims["container_id"] == "centaur-sandbox-pod-abc"
     no_proxy_hosts = env["NO_PROXY"].split(",")
+    assert "kubernetes.default.svc" in no_proxy_hosts
     assert "victoriametrics" in no_proxy_hosts
     assert "victorialogs" in no_proxy_hosts
 
@@ -971,14 +1000,18 @@ async def test_create_builds_per_sandbox_proxy_resources(
     assert sandbox_env["FIREWALL_HOST"] == proxy_service_name
     assert sandbox_env["HTTPS_PROXY"] == f"http://{proxy_service_name}:8080"
     no_proxy_hosts = sandbox_env["NO_PROXY"].split(",")
-    assert no_proxy_hosts[:6] == [
+    assert no_proxy_hosts[:9] == [
         "localhost",
         "127.0.0.1",
         proxy_service_name,
+        "kubernetes",
+        "kubernetes.default",
+        "kubernetes.default.svc",
+        "kubernetes.default.svc.cluster.local",
         "victoriametrics",
         "victorialogs",
-        "api.internal",
     ]
+    assert "api.internal" in no_proxy_hosts
     assert proxy_pod["metadata"]["labels"] == {
         "centaur.ai/iron-proxy": "true",
         "centaur.ai/sandbox-id": session.sandbox_id,

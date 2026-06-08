@@ -37,6 +37,7 @@ from api.proxy_config import (
 )
 from api.sandbox.base import SandboxBackend, SandboxSession
 from api.sandbox.config import (
+    KUBERNETES_API_NO_PROXY_HOSTS,
     OBSERVABILITY_NO_PROXY_HOSTS,
     build_harness_cmd,
     container_env,
@@ -534,8 +535,12 @@ def _build_tool_server_container(
         "localhost",
         "127.0.0.1",
         firewall_host,
+        *KUBERNETES_API_NO_PROXY_HOSTS,
         *OBSERVABILITY_NO_PROXY_HOSTS,
     ]
+    kubernetes_service_host = (os.getenv("KUBERNETES_SERVICE_HOST") or "").strip()
+    if kubernetes_service_host:
+        no_proxy_hosts.append(kubernetes_service_host)
     if api_host:
         no_proxy_hosts.append(api_host)
     no_proxy = ",".join(dict.fromkeys(no_proxy_hosts))
