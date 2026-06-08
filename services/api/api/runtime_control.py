@@ -1881,6 +1881,12 @@ async def release_assignment(
                     thread_key,
                     generation,
                 )
+                await conn.execute(
+                    "UPDATE sandbox_sessions SET agent_thread_id = NULL, updated_at = NOW() "
+                    "WHERE thread_key = $1 AND sandbox_id = $2",
+                    thread_key,
+                    active["runtime_id"],
+                )
                 if cancel_inflight:
                     await conn.execute(
                         "UPDATE agent_execution_requests SET status = 'cancelled', terminal_reason = 'released', "

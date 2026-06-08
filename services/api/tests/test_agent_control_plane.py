@@ -1823,6 +1823,47 @@ async def test_worker_delivers_harness_error_when_turn_done_is_empty(
 
 
 @pytest.mark.asyncio
+async def test_release_assignment_clears_runtime_resume_thread_id(db_pool):
+    from api.runtime_control import release_assignment
+
+    thread_key = f"slack:C-test:{uuid.uuid4().hex}:release-clears-resume"
+    runtime_id = f"rt-release-{uuid.uuid4().hex[:8]}"
+
+    await db_pool.execute(
+        "INSERT INTO agent_runtime_assignments ("
+        "thread_key, assignment_generation, runtime_id, harness, engine, "
+        "persona_id, prompt_ref, effective_agents_md_sha256, state"
+        ") VALUES ($1, 1, $2, 'codex', 'codex', NULL, 'harness:codex', 'sha', 'active')",
+        thread_key,
+        runtime_id,
+    )
+    await db_pool.execute(
+        "INSERT INTO sandbox_sessions ("
+        "thread_key, sandbox_id, harness, engine, state, agent_thread_id"
+        ") VALUES ($1, $2, 'codex', 'codex', 'idle', 'codex-thread-old')",
+        thread_key,
+        runtime_id,
+    )
+
+    result = await release_assignment(
+        db_pool,
+        thread_key=thread_key,
+        release_id=f"rel-{uuid.uuid4().hex[:8]}",
+        cancel_inflight=False,
+        stop_runtime=False,
+    )
+
+    assert result["released"] is True
+    session = await db_pool.fetchrow(
+        "SELECT agent_thread_id FROM sandbox_sessions WHERE thread_key = $1 AND sandbox_id = $2",
+        thread_key,
+        runtime_id,
+    )
+    assert session is not None
+    assert session["agent_thread_id"] is None
+
+
+@pytest.mark.asyncio
 async def test_worker_requeues_raw_harness_auth_error_once_on_fresh_runtime(db_pool):
     from api.runtime_control import _claim_next_execution, _process_execution
 
