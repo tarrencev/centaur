@@ -70,6 +70,48 @@ PYEOF
     fi
 fi
 
+# ── Kubernetes in-cluster kubeconfig ─────────────────────────────────────────
+# When operators opt into mounting a sandbox service-account token, make kubectl
+# usable without requiring the agent to hand-build --server/--token flags.
+KUBE_SA_DIR="${CENTAUR_KUBE_SERVICEACCOUNT_DIR:-/var/run/secrets/kubernetes.io/serviceaccount}"
+KUBE_TOKEN_FILE="$KUBE_SA_DIR/token"
+KUBE_CA_FILE="$KUBE_SA_DIR/ca.crt"
+KUBE_NAMESPACE_FILE="$KUBE_SA_DIR/namespace"
+if [ -z "${KUBECONFIG:-}" ] \
+    && [ -n "${KUBERNETES_SERVICE_HOST:-}" ] \
+    && [ -f "$KUBE_TOKEN_FILE" ] \
+    && [ -f "$KUBE_CA_FILE" ]; then
+    KUBE_PORT="${KUBERNETES_SERVICE_PORT:-443}"
+    KUBE_NAMESPACE="default"
+    if [ -f "$KUBE_NAMESPACE_FILE" ]; then
+        KUBE_NAMESPACE="$(cat "$KUBE_NAMESPACE_FILE")"
+    fi
+    mkdir -p "$HOME_DIR/.kube"
+    KUBECONFIG="$HOME_DIR/.kube/config"
+    export KUBECONFIG
+    cat > "$KUBECONFIG" <<EOF
+apiVersion: v1
+kind: Config
+clusters:
+- name: in-cluster
+  cluster:
+    server: https://${KUBERNETES_SERVICE_HOST}:${KUBE_PORT}
+    certificate-authority: ${KUBE_CA_FILE}
+users:
+- name: sandbox-service-account
+  user:
+    tokenFile: ${KUBE_TOKEN_FILE}
+contexts:
+- name: in-cluster
+  context:
+    cluster: in-cluster
+    user: sandbox-service-account
+    namespace: ${KUBE_NAMESPACE}
+current-context: in-cluster
+EOF
+    chmod 600 "$KUBECONFIG"
+fi
+
 # ── Codex settings ──────────────────────────────────────────────────────────
 # CODEX_AUTH_MODE selects how codex authenticates with the upstream:
 #   - api_key (default): codex uses an OPENAI_API_KEY against api.openai.com.

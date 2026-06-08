@@ -140,6 +140,46 @@ def test_sandbox_entrypoint_installs_codex_harness_config(tmp_path: Path) -> Non
     assert result.stdout == (harness_dir / "codex" / "config.toml").read_text()
 
 
+def test_sandbox_entrypoint_writes_in_cluster_kubeconfig(tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    harness_dir = _write_codex_harness_config(home)
+    serviceaccount_dir = tmp_path / "serviceaccount"
+    serviceaccount_dir.mkdir()
+    (serviceaccount_dir / "token").write_text("test-token")
+    (serviceaccount_dir / "ca.crt").write_text("test-ca")
+    (serviceaccount_dir / "namespace").write_text("centaur")
+
+    result = subprocess.run(
+        [
+            "bash",
+            str(ENTRYPOINT_SH),
+            "sh",
+            "-lc",
+            'printf "%s\n" "$KUBECONFIG"; cat "$KUBECONFIG"',
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env={
+            "HOME": str(home),
+            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+            "CENTAUR_HARNESS_CONFIG_DIR": str(harness_dir),
+            "CENTAUR_KUBE_SERVICEACCOUNT_DIR": str(serviceaccount_dir),
+            "KUBERNETES_SERVICE_HOST": "10.96.0.1",
+            "KUBERNETES_SERVICE_PORT": "443",
+        },
+    )
+
+    assert result.returncode == 0, result.stderr or result.stdout
+    kubeconfig_path, kubeconfig = result.stdout.split("\n", 1)
+    assert kubeconfig_path == str(home / ".kube" / "config")
+    assert "server: https://10.96.0.1:443" in kubeconfig
+    assert f"certificate-authority: {serviceaccount_dir / 'ca.crt'}" in kubeconfig
+    assert f"tokenFile: {serviceaccount_dir / 'token'}" in kubeconfig
+    assert "namespace: centaur" in kubeconfig
+    assert oct(Path(kubeconfig_path).stat().st_mode & 0o777) == "0o600"
+
+
 def test_sandbox_entrypoint_does_not_install_global_git_cache_rewrites(
     tmp_path: Path,
 ) -> None:
