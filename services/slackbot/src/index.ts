@@ -171,7 +171,7 @@ const slackHandler = async (c: Context<{ Variables: Variables }>) => {
 
 app.post(config.CENTAUR_SLACK_EVENTS_PATH, slackSignatureMiddleware, slackHandler)
 app.post('/api/slack/events', slackSignatureMiddleware, slackHandler)
-app.post('/api/slack/actions', slackSignatureMiddleware, slackHandler)
+app.post('/api/slack/actions', slackSignatureMiddleware, slackActionHandler)
 app.post('/api/slack/options', slackSignatureMiddleware, slackHandler)
 app.post('/api/slack/commands', slackSignatureMiddleware, slackCommandHandler)
 app.post('/api/webhooks/slack', slackSignatureMiddleware, slackHandler)
@@ -670,6 +670,155 @@ type SlackCommandPayload = {
   team_id?: string
 }
 
+type SlackBlockActionPayload = {
+  type?: string
+  callback_id?: string
+  trigger_id?: string
+  response_url?: string
+  team?: { id?: string; domain?: string }
+  user?: { id?: string; username?: string; name?: string; team_id?: string }
+  channel?: { id?: string; name?: string }
+  message?: { ts?: string; thread_ts?: string; text?: string }
+  actions?: SlackBlockAction[]
+}
+
+type SlackBlockAction = {
+  action_id?: string
+  block_id?: string
+  value?: string
+  action_ts?: string
+  type?: string
+}
+
+const WORKFLOW_ACTION_PREFIX = 'centaur.workflow.'
+
+async function slackActionHandler(c: Context<{ Variables: Variables }>) {
+  const payload = parseSlackActionBody(c.get('slackRawBody'))
+  if (!payload) return c.json({ ok: false, error: 'invalid_slack_action' }, 400)
+  if (payload.type !== 'block_actions') return c.json({ ok: true, ignored: true })
+
+  const action = payload.actions?.find(item =>
+    String(item.action_id ?? '').startsWith(WORKFLOW_ACTION_PREFIX)
+  )
+  if (!action?.action_id) return c.json({ ok: true, ignored: true })
+
+  const workflowName = action.action_id.slice(WORKFLOW_ACTION_PREFIX.length).trim()
+  if (!isValidWorkflowName(workflowName)) {
+    logWarn('slack_workflow_action_invalid_workflow_name', {
+      action_id: action.action_id,
+      workflow_name: workflowName
+    })
+    return c.json({ response_type: 'ephemeral', text: 'This action is not configured.' })
+  }
+
+  const actionInput = parseActionValue(action.value)
+  if (!actionInput) {
+    logWarn('slack_workflow_action_invalid_value', {
+      action_id: action.action_id,
+      workflow_name: workflowName
+    })
+    return c.json({ response_type: 'ephemeral', text: 'This action has an invalid payload.' })
+  }
+
+  const threadTs = payload.message?.thread_ts ?? payload.message?.ts
+  const threadKey =
+    payload.team?.id && payload.channel?.id && threadTs
+      ? `slack:${payload.team.id}:${payload.channel.id}:${threadTs}`
+      : undefined
+  const triggerKey = [
+    'slack-action',
+    payload.team?.id ?? 'unknown-team',
+    payload.channel?.id ?? 'unknown-channel',
+    payload.message?.ts ?? 'unknown-message',
+    action.action_id,
+    action.action_ts ?? Date.now().toString(),
+    payload.user?.id ?? 'unknown-user'
+  ].join(':')
+
+  runInBackground(
+    c,
+    dispatchSlackWorkflowAction({
+      workflowName,
+      threadKey,
+      triggerKey,
+      action,
+      actionInput,
+      payload
+    })
+  )
+  return c.json({
+    response_type: 'ephemeral',
+    text: `Starting ${workflowName.replaceAll('_', ' ')}...`
+  })
+}
+
+async function dispatchSlackWorkflowAction(opts: {
+  workflowName: string
+  threadKey?: string
+  triggerKey: string
+  action: SlackBlockAction
+  actionInput: Record<string, unknown>
+  payload: SlackBlockActionPayload
+}): Promise<void> {
+  const result = await handoff.startWorkflow({
+    workflow_name: opts.workflowName,
+    trigger_key: opts.triggerKey,
+    thread_key: opts.threadKey,
+    eager_start: true,
+    input: {
+      ...opts.actionInput,
+      slack: {
+        team_id: opts.payload.team?.id,
+        channel_id: opts.payload.channel?.id,
+        channel_name: opts.payload.channel?.name,
+        message_ts: opts.payload.message?.ts,
+        thread_ts: opts.payload.message?.thread_ts ?? opts.payload.message?.ts,
+        user_id: opts.payload.user?.id,
+        user_name: opts.payload.user?.username ?? opts.payload.user?.name,
+        action_id: opts.action.action_id,
+        action_ts: opts.action.action_ts,
+        response_url: opts.payload.response_url
+      },
+      delivery: {
+        platform: 'slack',
+        channel: opts.payload.channel?.id,
+        thread_ts: opts.payload.message?.thread_ts ?? opts.payload.message?.ts,
+        recipient_user_id: opts.payload.user?.id,
+        recipient_team_id: opts.payload.team?.id
+      }
+    }
+  })
+  if (!result.ok) {
+    logWarn('slack_workflow_action_handoff_failed', {
+      workflow_name: opts.workflowName,
+      status: result.status,
+      body: result.body
+    })
+    return
+  }
+  logInfo('slack_workflow_action_handoff_started', {
+    workflow_name: opts.workflowName,
+    status: result.status,
+    thread_key: opts.threadKey
+  })
+}
+
+function isValidWorkflowName(value: string): boolean {
+  return /^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$/.test(value)
+}
+
+function parseActionValue(value: string | undefined): Record<string, unknown> | null {
+  if (!value) return {}
+  try {
+    const parsed = JSON.parse(value)
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? (parsed as Record<string, unknown>)
+      : null
+  } catch {
+    return null
+  }
+}
+
 async function slackCommandHandler(c: Context<{ Variables: Variables }>) {
   const payload = parseSlackCommandBody(c.get('slackRawBody'))
   if (!payload?.command) return c.json({ ok: false, error: 'invalid_slack_command' }, 400)
@@ -810,6 +959,17 @@ function parseSlackBody(rawBody: string, contentType: string | undefined): Slack
 function parseSlackCommandBody(rawBody: string): SlackCommandPayload | null {
   try {
     return Object.fromEntries(new URLSearchParams(rawBody)) as SlackCommandPayload
+  } catch {
+    return null
+  }
+}
+
+function parseSlackActionBody(rawBody: string): SlackBlockActionPayload | null {
+  try {
+    const form = new URLSearchParams(rawBody)
+    const payload = form.get('payload')
+    if (!payload) return null
+    return JSON.parse(payload) as SlackBlockActionPayload
   } catch {
     return null
   }

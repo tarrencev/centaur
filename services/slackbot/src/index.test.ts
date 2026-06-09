@@ -11,6 +11,101 @@ afterEach(() => {
 })
 
 describe('Slack event HTTP dedupe', () => {
+  it('dispatches Centaur workflow block actions', async () => {
+    process.env.SLACK_SIGNING_SECRET = 'test-signing-secret'
+    process.env.SLACKBOT_API_KEY = 'test-centaur-api-key'
+    process.env.LINEAR_API_KEY = 'lin-test-key'
+    process.env.SLACK_FEEDBACK_LINEAR_TEAM_ID = 'team-feedback'
+    process.env.SLACK_FEEDBACK_LINEAR_PROJECT_ID = 'project-feedback'
+
+    const originalFetch = globalThis.fetch
+    const fetchMock = mock(async (input: string | URL | Request, init?: RequestInit) => {
+      const url = input instanceof Request ? input.url : String(input)
+      if (!url.endsWith('/workflows/runs')) {
+        return new Response(JSON.stringify({ ok: true }), { status: 200 })
+      }
+      const body = JSON.parse(init?.body as string) as {
+        workflow_name: string
+        eager_start: boolean
+        input: Record<string, unknown>
+      }
+      expect(init?.method).toBe('POST')
+      expect((init?.headers as Record<string, string>).Authorization).toBe(
+        'Bearer test-centaur-api-key'
+      )
+      expect(body.workflow_name).toBe('c7e_alert_action')
+      expect(body.eager_start).toBe(true)
+      expect(body.input).toMatchObject({
+        action: 'implement_pr',
+        fingerprint: 'fp_123',
+        slack: {
+          team_id: 'T123',
+          channel_id: 'C123',
+          message_ts: '1781036086.170229',
+          thread_ts: '1781036086.170229',
+          user_id: 'U123',
+          action_id: 'centaur.workflow.c7e_alert_action'
+        },
+        delivery: {
+          platform: 'slack',
+          channel: 'C123',
+          thread_ts: '1781036086.170229',
+          recipient_user_id: 'U123',
+          recipient_team_id: 'T123'
+        }
+      })
+      return new Response(JSON.stringify({ ok: true, run_id: 'wfr_action' }), { status: 200 })
+    })
+    globalThis.fetch = fetchMock as unknown as typeof fetch
+
+    try {
+      const { app } = await import('./index')
+      const payload = JSON.stringify({
+        type: 'block_actions',
+        team: { id: 'T123' },
+        user: { id: 'U123', username: 'alice' },
+        channel: { id: 'C123', name: 'alerts' },
+        message: { ts: '1781036086.170229' },
+        actions: [
+          {
+            type: 'button',
+            action_id: 'centaur.workflow.c7e_alert_action',
+            action_ts: '1781036090.000000',
+            value: JSON.stringify({ action: 'implement_pr', fingerprint: 'fp_123' })
+          }
+        ]
+      })
+      const body = new URLSearchParams({ payload }).toString()
+      const waits: Promise<unknown>[] = []
+      const executionCtx = {
+        waitUntil: (promise: Promise<unknown>) => {
+          waits.push(promise)
+        }
+      }
+
+      const response = await app.request(
+        '/api/slack/actions',
+        signedFormRequest(body, process.env.SLACK_SIGNING_SECRET),
+        {},
+        executionCtx as any
+      )
+
+      expect(response.status).toBe(200)
+      expect(await response.json()).toEqual({
+        response_type: 'ephemeral',
+        text: 'Starting c7e alert action...'
+      })
+      expect(waits).toHaveLength(1)
+      await Promise.all(waits)
+      const workflowCall = fetchMock.mock.calls.find(call =>
+        String(call[0]).endsWith('/workflows/runs')
+      )
+      expect(workflowCall).toBeDefined()
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  })
+
   it('creates Linear issues from configured feedback slash commands', async () => {
     process.env.SLACK_SIGNING_SECRET = 'test-signing-secret'
     process.env.LINEAR_API_KEY = 'lin-test-key'
