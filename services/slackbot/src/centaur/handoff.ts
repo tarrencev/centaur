@@ -6,11 +6,55 @@ export type CentaurHandoffResult =
   | { ok: true; status: number; body: unknown }
   | { ok: false; status: number; body: unknown }
 
+export type CentaurWorkflowRequest = {
+  workflow_name: string
+  input: Record<string, unknown>
+  trigger_key?: string
+  thread_key?: string
+  eager_start?: boolean
+}
+
 export class CentaurHandoff {
   readonly config: AppConfig
 
   constructor(config: AppConfig) {
     this.config = config
+  }
+
+  async startWorkflow(request: CentaurWorkflowRequest): Promise<CentaurHandoffResult> {
+    return withSpan(
+      'centaur.slackbot.workflow_start',
+      clientSpanOptions({
+        'centaur.workflow.name': request.workflow_name,
+        'centaur.thread_key': request.thread_key
+      }),
+      async span => {
+        const url = new URL('/workflows/runs', this.config.CENTAUR_API_URL)
+        const apiKey = centaurApiKey(this.config)
+        const response = await fetch(url, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            ...(request.thread_key ? { 'X-Centaur-Thread-Key': request.thread_key } : {}),
+            ...injectTraceHeaders(),
+            ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {})
+          },
+          body: JSON.stringify({
+            workflow_name: request.workflow_name,
+            trigger_key: request.trigger_key,
+            eager_start: request.eager_start ?? true,
+            input: request.input
+          })
+        })
+
+        spanAttributes(span, {
+          'http.response.status_code': response.status,
+          'centaur.handoff.ok': response.ok
+        })
+        const body = await readResponseBody(response)
+        return { ok: response.ok, status: response.status, body }
+      }
+    )
   }
 
   async emit(event: NormalizedSlackEvent): Promise<CentaurHandoffResult> {
