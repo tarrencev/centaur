@@ -117,6 +117,7 @@ Execution tuning:
 | `SLACK_FEEDBACK_COMMANDS`, `SLACK_FEEDBACK_ALLOWED_CHANNELS` | `slackbot.extraEnv`. | Feedback slash commands and optional channel allowlist. |
 | `SLACK_FEEDBACK_LINEAR_TEAM_ID`, `SLACK_FEEDBACK_LINEAR_PROJECT_ID` | `slackbot.extraEnv`. | Linear destination for feedback issues. |
 | `SLACKBOT_EXTERNAL_ORG_ALLOWLIST` | `slackbot.extraEnv`. | Slack team ids allowed for external org handoff. |
+| `SLACK_TEAM_ID` | `slackbot.extraEnv`. | Workspace team ID (e.g. `T01ABCD2EFG`) used to rewrite `https://*.slack.com/archives/...` URLs in final-delivery messages into native `slack://channel?team=...` deep links that open in the Slack app. Leave unset to keep archive URLs unchanged. |
 | `COMMIT_SHA` | Build/deploy env. | Commit shown in Slackbot metadata. |
 
 ## Sandbox
@@ -163,6 +164,7 @@ Sandbox entrypoint and wrappers:
 | `GOOGLE_APPLICATION_CREDENTIALS` | Sandbox entrypoint or `sandbox.extraEnv`. | Google ADC path; entrypoint creates a local stub when unset. |
 | `CODEX_API_KEY`, `CODEX_HOME`, `CODEX_CONTINUE_THREAD_ID` | `sandbox.extraEnv` or runtime resume. | Codex auth/config/resume behavior. |
 | `CODEX_AUTH_MODE` | `sandbox.extraEnv`. | Codex auth flow: `api_key` (default, hits `api.openai.com`) or `access_token` (hits `chatgpt.com` via the brokered ChatGPT login). See [Codex Auth Modes](/deploying-in-production#codex-auth-modes). |
+| `CODEX_MODEL_REASONING_SUMMARY` | `sandbox.extraEnv`. | Sets `model_reasoning_summary` in the Codex config (`auto`, `concise`, `detailed`, `none`). Codex >= 0.139 emits no reasoning summaries unless this is set, so renderers show no thinking trace. |
 | `CLAUDE_MODEL`, `CLAUDE_CONTINUE_SESSION_ID` | `sandbox.extraEnv` or runtime resume. | Claude model and resume behavior. |
 | `CLAUDE_CODE_AUTH_MODE` | `sandbox.extraEnv`. | Claude Code auth flow: `api_key` (default, uses `ANTHROPIC_API_KEY`) or `access_token` (Claude.ai Pro or Max via the brokered OAuth login). See [Claude Auth Modes](/deploying-in-production#claude-auth-modes). |
 | `DEPLOY_ENV`, `ENVIRONMENT`, `TRACEPARENT` | Deployment env or wrapper-generated. | Runtime environment and trace context. |
