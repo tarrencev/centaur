@@ -94,6 +94,11 @@ const SLACK_FALLBACK_TEXT_MAX_CHARS = 35_000
 const POSTGRES_CONNECT_INITIAL_DELAY_MS = 250
 const POSTGRES_CONNECT_MAX_DELAY_MS = 10_000
 
+type RenderRecoveryLease = {
+  expiresAt: number
+  token: string
+}
+
 export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
   const userName = options.userName ?? 'centaur'
   const logger = options.logger ?? noopLogger
@@ -764,12 +769,20 @@ async function recoverRenderObligations(
         continue
       }
 
+      const leaseKey = renderRecoveryLeaseKey(threadId)
       const leaseToken = randomUUID()
-      const leaseAcquired = await state.setIfNotExists(
-        renderRecoveryLeaseKey(threadId),
-        leaseToken,
+      let leaseAcquired = await state.setIfNotExists(
+        leaseKey,
+        newRenderRecoveryLease(leaseToken),
         RENDER_RECOVERY_LEASE_TTL_MS
       )
+      if (!leaseAcquired && (await clearExpiredRenderLease(state, leaseKey))) {
+        leaseAcquired = await state.setIfNotExists(
+          leaseKey,
+          newRenderRecoveryLease(leaseToken),
+          RENDER_RECOVERY_LEASE_TTL_MS
+        )
+      }
       if (!leaseAcquired) {
         // Another holder (or a lease from a crashed pass, pending TTL expiry)
         // owns this thread. Count it as deferred so the retry loop keeps
@@ -781,8 +794,8 @@ async function recoverRenderObligations(
         continue
       }
       const releaseLease = async (): Promise<void> => {
-        const activeLeaseToken = await state.get<string>(renderRecoveryLeaseKey(threadId))
-        if (activeLeaseToken === leaseToken) await state.delete(renderRecoveryLeaseKey(threadId))
+        const activeLease = await state.get<unknown>(leaseKey)
+        if (renderRecoveryLeaseToken(activeLease) === leaseToken) await state.delete(leaseKey)
       }
 
       // A single hung recovery (for example an event stream that never
@@ -985,24 +998,54 @@ async function acquireRenderLease(
 ): Promise<() => Promise<void>> {
   const key = renderRecoveryLeaseKey(threadId)
   const token = randomUUID()
-  await state.set(key, token, RENDER_RECOVERY_LEASE_TTL_MS)
+  await state.set(key, newRenderRecoveryLease(token), RENDER_RECOVERY_LEASE_TTL_MS)
   const refresh = setInterval(() => {
     void state
-      .get<string>(key)
+      .get<unknown>(key)
       .then(current =>
-        current === token ? state.set(key, token, RENDER_RECOVERY_LEASE_TTL_MS) : undefined
+        renderRecoveryLeaseToken(current) === token
+          ? state.set(key, newRenderRecoveryLease(token), RENDER_RECOVERY_LEASE_TTL_MS)
+          : undefined
       )
       .catch(() => undefined)
   }, RENDER_LEASE_REFRESH_INTERVAL_MS)
   return async () => {
     clearInterval(refresh)
     try {
-      const current = await state.get<string>(key)
-      if (current === token) await state.delete(key)
+      const current = await state.get<unknown>(key)
+      if (renderRecoveryLeaseToken(current) === token) await state.delete(key)
     } catch {
       // Best effort: TTL expiry is the backstop.
     }
   }
+}
+
+function newRenderRecoveryLease(token: string): RenderRecoveryLease {
+  return {
+    expiresAt: Date.now() + RENDER_RECOVERY_LEASE_TTL_MS,
+    token
+  }
+}
+
+function parseRenderRecoveryLease(value: unknown): RenderRecoveryLease | null {
+  if (!value || typeof value !== 'object') return null
+  const lease = value as Partial<RenderRecoveryLease>
+  if (typeof lease.token !== 'string' || typeof lease.expiresAt !== 'number') return null
+  return { expiresAt: lease.expiresAt, token: lease.token }
+}
+
+function renderRecoveryLeaseToken(value: unknown): string | undefined {
+  const parsed = parseRenderRecoveryLease(value)
+  if (parsed) return parsed.token
+  return typeof value === 'string' ? value : undefined
+}
+
+async function clearExpiredRenderLease(state: StateAdapter, key: string): Promise<boolean> {
+  const current = await state.get<unknown>(key)
+  const lease = parseRenderRecoveryLease(current)
+  if (!lease || lease.expiresAt > Date.now()) return false
+  await state.delete(key)
+  return true
 }
 
 async function renderExecutionStream(

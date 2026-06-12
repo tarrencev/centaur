@@ -1978,6 +1978,57 @@ describe('slackbotv2', () => {
     expect(Number(recoveredThreadState?.lastEventId)).toBeGreaterThan(0)
   })
 
+  it('recovers when an expired render lease row is still present', async () => {
+    const sharedState = createMemoryState()
+    await sharedState.connect()
+
+    const parent = await postUserMessage('Context before expired lease recovery.')
+    const mentionText = `<@${BOT_USER_ID}> recover after expired lease`
+    const mention = await postUserMessage(mentionText, parent.ts)
+    const key = threadKey(parent.ts)
+    const message = apiMessageFromSlackEvent({
+      isMention: true,
+      text: mentionText,
+      threadId: key,
+      ts: mention.ts
+    })
+    await sharedState.set(`thread-state:${key}`, {
+      activeExecution: true,
+      executedMessageIds: [mention.ts],
+      forwardedMessageIds: [mention.ts],
+      historyForwarded: true,
+      lastEventId: 0,
+      renderObligation: {
+        afterEventId: 0,
+        executionId: 'exe-expired-lease',
+        message
+      }
+    })
+    await sharedState.appendToList('slackbotv2:render:index', key)
+    await sharedState.set(`slackbotv2:render:lease:${key}`, {
+      expiresAt: Date.now() - 1,
+      token: 'expired-token'
+    })
+    codexApi.emitOutputLines(key, sampleCodexOutputLines('Recovered after expired lease.'))
+
+    bot = createTestBot({ state: sharedState })
+
+    await waitFor(() => codexApi.eventRequests.length === 1, 2000)
+    await waitFor(() => slackApi.calls.some(call => call.method === 'chat.stopStream'), 2000)
+
+    expect(codexApi.eventRequests).toEqual([
+      { afterEventId: 0, executionId: 'exe-expired-lease', threadKey: key }
+    ])
+    expect(await threadText(parent.ts)).toContain('Recovered after expired lease.')
+    const recoveredThreadState = await sharedState.get<Record<string, unknown>>(
+      `thread-state:${key}`
+    )
+    expect(recoveredThreadState).toEqual(
+      expect.objectContaining({ activeExecution: false, renderObligation: null })
+    )
+    expect(await sharedState.get(`slackbotv2:render:lease:${key}`)).toBeNull()
+  })
+
   it('does not let one hung recovery block the obligations queued behind it', async () => {
     const sharedState = createMemoryState()
     await sharedState.connect()

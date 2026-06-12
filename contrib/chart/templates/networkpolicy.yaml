@@ -52,6 +52,11 @@ spec:
         - podSelector:
             matchLabels:
 {{ include "centaur.componentSelectorLabels" (dict "root" . "component" "api-rs") | nindent 14 }}
+        # Rust workflow-host runs Python workflow code in short-lived
+        # workflow-run sandbox pods. Those pods use DATABASE_URL directly.
+        - podSelector:
+            matchLabels:
+              centaur.ai/component: workflow-run
 {{- end }}
 {{- if .Values.slackbotv2.enabled }}
         - podSelector:
@@ -166,6 +171,29 @@ spec:
     - ports:
         - protocol: TCP
           port: {{ .Values.networkPolicy.apiServerPort }}
+---
+{{- end }}
+{{- if and .Values.apiRs.enabled .Values.postgres.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "centaur.fullname" . }}-workflow-run-postgres
+  labels:
+{{ include "centaur.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      centaur.ai/component: workflow-run
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+{{ include "centaur.componentSelectorLabels" (dict "root" . "component" "postgres") | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: 5432
 ---
 {{- end }}
 {{- if .Values.slackbotv2.enabled }}
