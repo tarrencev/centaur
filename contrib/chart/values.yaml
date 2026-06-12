@@ -144,6 +144,11 @@ secrets:
 overlay:
   mountPath: /app/overlay/org
   systemPrompt: ""
+  image:
+    repository: ""
+    tag: latest
+    pullPolicy: Always
+    sourcePath: /overlay
 
 sandbox:
   controller: pod
