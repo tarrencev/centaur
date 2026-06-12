@@ -751,10 +751,28 @@ impl SandboxArgs {
     }
 
     fn agent_k8s_workflow_dirs(&self) -> String {
+        let mut dirs = Vec::new();
         if let Some(repo) = clean_optional_value(self.tools_source.repo.as_deref()) {
-            return format!("{SANDBOX_REPOS_MOUNT_PATH}/{repo}/workflows");
+            dirs.push(format!("{SANDBOX_REPOS_MOUNT_PATH}/{repo}/workflows"));
         }
-        "/opt/centaur/workflows".to_owned()
+        if let Some(value) = clean_optional_value(self.tools_source.extra_sources.as_deref()) {
+            match serde_json::from_str::<Vec<ToolSourceArg>>(&value) {
+                Ok(sources) => {
+                    dirs.extend(sources.into_iter().filter_map(|source| {
+                        let repo = clean_optional_value(Some(source.repo.as_str()))?;
+                        Some(format!("{SANDBOX_REPOS_MOUNT_PATH}/{repo}/workflows"))
+                    }));
+                }
+                Err(err) => {
+                    tracing::warn!(error = %err, "invalid KUBERNETES_TOOLS_EXTRA_SOURCES; ignoring extra workflow dirs");
+                }
+            }
+        }
+        if dirs.is_empty() {
+            "/opt/centaur/workflows".to_owned()
+        } else {
+            dirs.join(":")
+        }
     }
 
     fn default_workflow_host_path(&self) -> String {
@@ -1827,6 +1845,10 @@ mod tests {
             "/home/agent/github/paradigmxyz/centaur/tools",
             "--tools-overlay-path",
             "/home/agent/github/tempoxyz/centaur-tempo/tools",
+            "--kubernetes-tools-repo",
+            "paradigmxyz/centaur",
+            "--kubernetes-tools-extra-sources",
+            r#"[{"repo":"cartridge-gg/agent","ref":"sha","subdir":"tools"}]"#,
             "--session-sandbox-passthrough-env",
             "TOOLS_PATH,TOOLS_OVERLAY_PATH",
         ])
@@ -1842,6 +1864,15 @@ mod tests {
                         source_path: "/var/lib/centaur/repos".to_owned(),
                     }
         }));
+        assert_eq!(
+            spec.env
+                .iter()
+                .find(|env| env.name == "WORKFLOW_DIRS")
+                .map(|env| env.value.as_str()),
+            Some(
+                "/home/agent/github/paradigmxyz/centaur/workflows:/home/agent/github/cartridge-gg/agent/workflows"
+            )
+        );
         assert_eq!(
             spec.env
                 .iter()
