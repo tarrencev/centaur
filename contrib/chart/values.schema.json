@@ -102,6 +102,12 @@
       "properties": {
         "mountPath": { "type": "string" },
         "systemPrompt": { "type": "string" },
+        "workflows": {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean" }
+          }
+        },
         "image": {
           "type": "object",
           "properties": {
