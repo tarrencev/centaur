@@ -19,7 +19,9 @@
 {{- end -}}
 {{- if .Values.overlay.image.repository -}}
 {{- $toolDirs = append $toolDirs (printf "%s/tools" .Values.overlay.mountPath) -}}
+{{- if .Values.overlay.workflows.enabled -}}
 {{- $workflowDirs = printf "%s:%s/workflows" $workflowDirs .Values.overlay.mountPath -}}
+{{- end -}}
 {{- end -}}
 {{- $apiRsMetricsAnnotations := dict -}}
 {{- if .Values.apiRs.metrics.scrapeAnnotations -}}

@@ -144,6 +144,8 @@ secrets:
 overlay:
   mountPath: /app/overlay/org
   systemPrompt: ""
+  workflows:
+    enabled: true
   image:
     repository: ""
     tag: latest
