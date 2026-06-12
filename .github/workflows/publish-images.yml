@@ -8,6 +8,7 @@ on:
     tags: [v*]
     paths:
       - .github/workflows/publish-images.yml
+      - contrib/chart/**
       - services/**
       - centaur_sdk/**
       - packages/**
