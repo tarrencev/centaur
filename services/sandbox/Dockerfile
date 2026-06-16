@@ -32,6 +32,7 @@ RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
     faster-whisper \
     asyncpg==0.30.0 \
     opentelemetry-proto==1.42.1 \
+    tomli-w==1.2.0 \
     && find /usr/local/lib/python3.12 /usr/lib/python3 -type d -name __pycache__ -prune -exec rm -rf '{}' +
 
 # ── GitHub CLI + Node.js 24 (LTS) + Docker CLI (single layer, cached) ─────────────
