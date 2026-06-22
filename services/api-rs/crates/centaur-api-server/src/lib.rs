@@ -438,6 +438,59 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn anthropic_messages_threads_model_and_system_into_sandbox_env() {
+        let _lock = DB_TEST_LOCK.lock().await;
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let (app, backend) = anthropic_test_app_with_backend(
+            store,
+            vec![
+                json!({"type":"assistant","message":{"content":[{"type":"text","text":"PONG"}]}})
+                    .to_string(),
+                json!({"type":"result","result":"PONG"}).to_string(),
+            ],
+        );
+        let thread_key = format!("api-test:{}", uuid::Uuid::new_v4());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("X-Centaur-Thread-Key", thread_key)
+                    .body(Body::from(
+                        json!({
+                            "model": "claude-opus-4-test",
+                            "system": [
+                                {"type": "text", "text": "caller layer one"},
+                                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "ignored"}},
+                                {"type": "text", "text": "caller layer two"}
+                            ],
+                            "max_tokens": 16,
+                            "messages": [{"role": "user", "content": "ping"}]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let specs = backend.created_specs().await;
+        assert_eq!(specs.len(), 1);
+        assert_eq!(
+            env_value(&specs[0], "CLAUDE_MODEL"),
+            Some("claude-opus-4-test")
+        );
+        assert_eq!(
+            env_value(&specs[0], "CENTAUR_EXTRA_SYSTEM_PROMPT"),
+            Some("caller layer one\ncaller layer two")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn anthropic_messages_generates_thread_key_when_header_absent() {
         let _lock = DB_TEST_LOCK.lock().await;
         let Some(store) = test_store().await else {
@@ -541,6 +594,7 @@ mod tests {
     struct ScriptedStdoutBackend {
         next_id: AtomicU64,
         script: Mutex<Vec<String>>,
+        created_specs: Mutex<Vec<SandboxSpec>>,
     }
 
     impl ScriptedStdoutBackend {
@@ -548,7 +602,12 @@ mod tests {
             Self {
                 next_id: AtomicU64::new(0),
                 script: Mutex::new(script),
+                created_specs: Mutex::new(Vec::new()),
             }
+        }
+
+        async fn created_specs(&self) -> Vec<SandboxSpec> {
+            self.created_specs.lock().await.clone()
         }
     }
 
@@ -558,7 +617,8 @@ mod tests {
             "scripted"
         }
 
-        async fn create(&self, _spec: SandboxSpec) -> SandboxResult<SandboxHandle> {
+        async fn create(&self, spec: SandboxSpec) -> SandboxResult<SandboxHandle> {
+            self.created_specs.lock().await.push(spec);
             let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
             Ok(SandboxHandle::new(
                 SandboxId::new(format!("scripted-{id}")),
@@ -638,13 +698,27 @@ mod tests {
     }
 
     fn anthropic_test_app(store: PgSessionStore, script: Vec<String>) -> axum::Router {
-        build_router_with_runtime(
+        let (app, _) = anthropic_test_app_with_backend(store, script);
+        app
+    }
+
+    fn anthropic_test_app_with_backend(
+        store: PgSessionStore,
+        script: Vec<String>,
+    ) -> (axum::Router, Arc<ScriptedStdoutBackend>) {
+        let backend = Arc::new(ScriptedStdoutBackend::new(script));
+        let app = build_router_with_runtime(
             store,
-            SandboxRuntime::backend(
-                Arc::new(ScriptedStdoutBackend::new(script)),
-                SandboxSpec::new("scripted"),
-            ),
-        )
+            SandboxRuntime::backend(backend.clone(), SandboxSpec::new("scripted")),
+        );
+        (app, backend)
+    }
+
+    fn env_value<'a>(spec: &'a SandboxSpec, name: &str) -> Option<&'a str> {
+        spec.env
+            .iter()
+            .find(|env| env.name == name)
+            .map(|env| env.value.as_str())
     }
 
     fn sse_event_names(body: &str) -> Vec<&str> {

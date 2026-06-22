@@ -4,14 +4,19 @@
 //! the existing [`centaur_session_runtime::SessionRuntime`]. Thread continuity
 //! is controlled by `X-Centaur-Thread-Key`; when the header is absent a new
 //! `api:<uuid-v4>` thread key is generated and validated through
-//! [`centaur_session_core::ThreadKey`]. Centaur owns harness, persona, and tool
-//! configuration: request `model`, `system`, and `tools` are accepted for
-//! client compatibility, `model` is echoed in responses, and `system`/`tools`
-//! are ignored. This endpoint currently defaults to `HarnessType::ClaudeCode`
-//! because that wrapper emits Anthropic-shaped content blocks. v1 appends only
-//! the trailing `role:"user"` message from `messages[]`; full-history replay is
-//! a follow-up. The route is unauthenticated and network-gated like
-//! `/api/session/*`; authentication is a follow-up.
+//! [`centaur_session_core::ThreadKey`]. This endpoint defaults to
+//! `HarnessType::ClaudeCode` because that wrapper emits Anthropic-shaped
+//! content blocks. Request `model` selects the Claude Code model and request
+//! `system` is appended as an extra system prompt after Centaur's internal
+//! persona/AGENTS.md; neither replaces nor exposes Centaur's internal prompt.
+//! Because the app-server sandbox is created once and reused per thread, model
+//! and system are first-request-wins for a reused `X-Centaur-Thread-Key`. Codex
+//! model/system handling is out of scope for this ingress. Request `tools`
+//! remains accepted only for client compatibility and is decorative until tool
+//! support lands separately. v1 appends only the trailing `role:"user"` message
+//! from `messages[]`; full-history replay is a follow-up. The route is
+//! unauthenticated and network-gated like `/api/session/*`; authentication is a
+//! follow-up.
 
 mod translate;
 
@@ -163,7 +168,9 @@ pub(crate) async fn anthropic_messages(
     Json(request): Json<AnthropicMessagesRequest>,
 ) -> Result<Response, AnthropicHttpError> {
     let thread_key = thread_key_from_headers(&headers)?;
-    let _decorative = (&request.system, request.max_tokens, &request.tools);
+    let model = non_empty_string(&request.model);
+    let system_prompt = flatten_system_prompt(request.system.as_ref());
+    let _decorative = (request.max_tokens, &request.tools);
     let runtime = state.runtime()?;
     let _outcome = runtime
         .create_or_get_session(
@@ -206,6 +213,8 @@ pub(crate) async fn anthropic_messages(
                 input_lines: vec![input_line],
                 idle_timeout_ms: None,
                 max_duration_ms: None,
+                model,
+                system_prompt,
             },
         )
         .await
@@ -303,6 +312,27 @@ fn input_parts(message: &AnthropicInputMessage) -> Vec<Value> {
         AnthropicInputContent::Text(text) => vec![json!({"type": "text", "text": text})],
         AnthropicInputContent::Blocks(blocks) => blocks.clone(),
     }
+}
+
+fn flatten_system_prompt(system: Option<&Value>) -> Option<String> {
+    match system? {
+        Value::String(text) => non_empty_string(text),
+        Value::Array(blocks) => {
+            let text = blocks
+                .iter()
+                .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
+                .filter_map(|block| block.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n");
+            non_empty_string(&text)
+        }
+        _ => None,
+    }
+}
+
+fn non_empty_string(value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()).then(|| value.to_owned())
 }
 
 async fn collect_non_streaming_message<S>(

@@ -129,6 +129,8 @@ pub struct ExecuteSessionInput {
     pub input_lines: Vec<String>,
     pub idle_timeout_ms: Option<u64>,
     pub max_duration_ms: Option<u64>,
+    pub model: Option<String>,
+    pub system_prompt: Option<String>,
 }
 
 #[derive(Clone)]
@@ -167,6 +169,21 @@ struct SandboxReadyObservation<'a> {
     source: &'static str,
     ready_duration: Duration,
     startup_duration: Option<Duration>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct SessionSandboxOverrides<'a> {
+    model: Option<&'a str>,
+    system_prompt: Option<&'a str>,
+}
+
+impl SessionSandboxOverrides<'_> {
+    fn has_overrides(self) -> bool {
+        self.model.is_some_and(|model| !model.trim().is_empty())
+            || self
+                .system_prompt
+                .is_some_and(|prompt| !prompt.trim().is_empty())
+    }
 }
 
 impl SessionRuntime {
@@ -536,6 +553,8 @@ impl SessionRuntime {
             input_lines,
             idle_timeout_ms,
             max_duration_ms,
+            model,
+            system_prompt,
         } = input;
         let input_line_count = input_lines.len();
         let idempotency_key_present = idempotency_key.is_some();
@@ -650,6 +669,10 @@ impl SessionRuntime {
                     session.sandbox_id.as_deref(),
                     session.iron_control_principal.as_deref(),
                     &execution.execution_id,
+                    SessionSandboxOverrides {
+                        model: model.as_deref(),
+                        system_prompt: system_prompt.as_deref(),
+                    },
                 )
                 .await
             {
@@ -963,6 +986,7 @@ impl SessionRuntime {
         existing_sandbox_id: Option<&str>,
         iron_control_principal: Option<&str>,
         execution_id: &str,
+        overrides: SessionSandboxOverrides<'_>,
     ) -> Result<String, SessionRuntimeError> {
         let span = info_span!(
             "centaur.api_rs.sandbox.ensure",
@@ -1106,15 +1130,24 @@ impl SessionRuntime {
 
             // Warm sandboxes are pre-booted with the workload's default
             // harness; a session on any other harness needs a cold sandbox.
+            let has_sandbox_overrides = overrides.has_overrides();
             let warm_harness_matches = self
                 .sandbox_runtime
                 .warm_harness
                 .as_ref()
                 .is_none_or(|warm| warm == harness_type);
-            if !warm_harness_matches && self.warm_pool.is_some() {
-                record_sandbox_warm_pool_claim("harness_mismatch");
+            if self.warm_pool.is_some() {
+                if has_sandbox_overrides {
+                    record_sandbox_warm_pool_claim("request_overrides");
+                } else if !warm_harness_matches {
+                    record_sandbox_warm_pool_claim("harness_mismatch");
+                }
             }
-            if let Some(warm_pool) = self.warm_pool.as_ref().filter(|_| warm_harness_matches) {
+            if let Some(warm_pool) = self
+                .warm_pool
+                .as_ref()
+                .filter(|_| warm_harness_matches && !has_sandbox_overrides)
+            {
                 match warm_pool
                     .claim(thread_key.as_str(), iron_control_principal)
                     .await
@@ -1173,6 +1206,7 @@ impl SessionRuntime {
 
             let mut spec =
                 (self.sandbox_runtime.spec_factory)(thread_key, execution_id, harness_type);
+            apply_session_sandbox_overrides(&mut spec, harness_type, overrides);
             if let Some(principal) = iron_control_principal {
                 spec.iron_control_principal = Some(principal.to_owned());
             }
@@ -1855,6 +1889,38 @@ fn harness_server_subcommand(harness: &HarnessType) -> &'static str {
         HarnessType::ClaudeCode => "claude-code",
         HarnessType::Amp => "amp",
     }
+}
+
+fn apply_session_sandbox_overrides(
+    spec: &mut SandboxSpec,
+    harness: &HarnessType,
+    overrides: SessionSandboxOverrides<'_>,
+) {
+    // PR A intentionally scopes request model/system to ClaudeCode. Codex and
+    // Amp request-level model/system handling need separate harness semantics.
+    if !matches!(harness, HarnessType::ClaudeCode) {
+        return;
+    }
+    if let Some(model) = overrides.model.and_then(non_empty_str) {
+        upsert_env(spec, "CLAUDE_MODEL", model);
+    }
+    if let Some(system_prompt) = overrides.system_prompt.and_then(non_empty_str) {
+        upsert_env(spec, "CENTAUR_EXTRA_SYSTEM_PROMPT", system_prompt);
+    }
+}
+
+fn upsert_env(spec: &mut SandboxSpec, name: &str, value: &str) {
+    if let Some(existing) = spec.env.iter_mut().find(|env| env.name == name) {
+        existing.value = value.to_owned();
+    } else {
+        spec.env
+            .push(centaur_sandbox_core::EnvVar::new(name, value));
+    }
+}
+
+fn non_empty_str(value: &str) -> Option<&str> {
+    let value = value.trim();
+    (!value.is_empty()).then_some(value)
 }
 
 fn sandbox_spec_key(spec: &SandboxSpec) -> String {

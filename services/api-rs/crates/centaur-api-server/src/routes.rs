@@ -356,6 +356,8 @@ async fn execute_session(
                 input_lines: request.input_lines,
                 idle_timeout_ms: request.idle_timeout_ms,
                 max_duration_ms: request.max_duration_ms,
+                model: None,
+                system_prompt: None,
             },
         )
         .await?;
