@@ -1,0 +1,376 @@
+//! Anthropic Messages API ingress backed by Centaur sessions.
+//!
+//! `POST /v1/messages` accepts Anthropic-compatible requests and maps them to
+//! the existing [`centaur_session_runtime::SessionRuntime`]. Thread continuity
+//! is controlled by `X-Centaur-Thread-Key`; when the header is absent a new
+//! `api:<uuid-v4>` thread key is generated and validated through
+//! [`centaur_session_core::ThreadKey`]. Centaur owns harness, persona, and tool
+//! configuration: request `model`, `system`, and `tools` are accepted for
+//! client compatibility, `model` is echoed in responses, and `system`/`tools`
+//! are ignored. This endpoint currently defaults to `HarnessType::ClaudeCode`
+//! because that wrapper emits Anthropic-shaped content blocks. v1 appends only
+//! the trailing `role:"user"` message from `messages[]`; full-history replay is
+//! a follow-up. The route is unauthenticated and network-gated like
+//! `/api/session/*`; authentication is a follow-up.
+
+mod translate;
+
+use std::{
+    convert::Infallible,
+    sync::{Arc, Mutex},
+};
+
+use axum::{
+    Json,
+    extract::State,
+    http::{HeaderMap, StatusCode},
+    response::{
+        IntoResponse, Response, Sse,
+        sse::{Event, KeepAlive},
+    },
+};
+use centaur_session_core::{
+    HarnessType, MessageRole, SessionEvent, SessionMessageInput, ThreadKey, empty_object,
+};
+use centaur_session_runtime::{ExecuteSessionInput, HarnessConflictPolicy};
+use futures_util::{StreamExt, stream};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use uuid::Uuid;
+
+use crate::{ApiError, error::error_chain, routes::AppState};
+use translate::{AnthropicTranslator, error_event};
+
+const THREAD_KEY_HEADER: &str = "x-centaur-thread-key";
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct AnthropicMessagesRequest {
+    pub model: String,
+    pub messages: Vec<AnthropicInputMessage>,
+    #[serde(default)]
+    pub system: Option<Value>,
+    #[serde(default)]
+    pub stream: bool,
+    pub max_tokens: u32,
+    #[serde(default)]
+    pub metadata: Option<Value>,
+    #[serde(default)]
+    pub tools: Option<Value>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct AnthropicInputMessage {
+    pub role: String,
+    pub content: AnthropicInputContent,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(untagged)]
+pub enum AnthropicInputContent {
+    Text(String),
+    Blocks(Vec<Value>),
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct AnthropicMessage {
+    id: String,
+    #[serde(rename = "type")]
+    kind: &'static str,
+    role: &'static str,
+    model: String,
+    content: Vec<Value>,
+    stop_reason: Option<String>,
+    stop_sequence: Option<String>,
+    usage: AnthropicUsage,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct AnthropicUsage {
+    input_tokens: u32,
+    output_tokens: u32,
+}
+
+#[derive(Debug)]
+pub(crate) struct AnthropicHttpError {
+    status: StatusCode,
+    error_type: &'static str,
+    message: String,
+}
+
+impl AnthropicHttpError {
+    fn bad_request(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            error_type: "invalid_request_error",
+            message: message.into(),
+        }
+    }
+
+    fn internal(error: impl std::error::Error) -> Self {
+        tracing::error!(
+            error = %error_chain(&error),
+            "Anthropic Messages request failed"
+        );
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            error_type: "api_error",
+            message: "internal server error".to_owned(),
+        }
+    }
+}
+
+impl From<ApiError> for AnthropicHttpError {
+    fn from(error: ApiError) -> Self {
+        let response = error.into_response();
+        let status = response.status();
+        if status.is_server_error() {
+            return Self {
+                status,
+                error_type: "api_error",
+                message: "internal server error".to_owned(),
+            };
+        }
+        Self {
+            status,
+            error_type: "invalid_request_error",
+            message: status
+                .canonical_reason()
+                .unwrap_or("request failed")
+                .to_owned(),
+        }
+    }
+}
+
+impl IntoResponse for AnthropicHttpError {
+    fn into_response(self) -> Response {
+        (
+            self.status,
+            Json(json!({
+                "type": "error",
+                "error": {
+                    "type": self.error_type,
+                    "message": self.message,
+                },
+            })),
+        )
+            .into_response()
+    }
+}
+
+pub(crate) async fn anthropic_messages(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<AnthropicMessagesRequest>,
+) -> Result<Response, AnthropicHttpError> {
+    let thread_key = thread_key_from_headers(&headers)?;
+    let _decorative = (&request.system, request.max_tokens, &request.tools);
+    let runtime = state.runtime()?;
+    let _outcome = runtime
+        .create_or_get_session(
+            &thread_key,
+            &HarnessType::ClaudeCode,
+            None,
+            request.metadata.clone(),
+            HarnessConflictPolicy::Reject,
+        )
+        .await
+        .map_err(AnthropicHttpError::internal)?;
+
+    let user_message = trailing_user_message(&request)?;
+    let parts = input_parts(user_message);
+    let session_message = SessionMessageInput {
+        client_message_id: None,
+        role: MessageRole::User,
+        parts: parts.clone(),
+        metadata: empty_object(),
+    };
+    runtime
+        .append_messages(&thread_key, &[session_message])
+        .await
+        .map_err(AnthropicHttpError::internal)?;
+
+    let input_line = serde_json::to_string(&json!({
+        "type": "user",
+        "message": {
+            "role": "user",
+            "content": parts,
+        },
+    }))
+    .map_err(AnthropicHttpError::internal)?;
+    let execution = runtime
+        .execute_session(
+            &thread_key,
+            ExecuteSessionInput {
+                idempotency_key: None,
+                metadata: None,
+                input_lines: vec![input_line],
+                idle_timeout_ms: None,
+                max_duration_ms: None,
+            },
+        )
+        .await
+        .map_err(AnthropicHttpError::internal)?;
+    let events = runtime
+        .stream_events(&thread_key, 0, Some(&execution.execution_id))
+        .await
+        .map_err(AnthropicHttpError::internal)?;
+
+    let message_id = format!("msg_{}", Uuid::new_v4());
+    if request.stream {
+        let thread_key_for_log = thread_key.clone();
+        let translator = Arc::new(Mutex::new(AnthropicTranslator::new(
+            message_id,
+            request.model,
+        )));
+        let events = Box::pin(events);
+        let stream = stream::unfold(
+            (events, false, translator, thread_key_for_log),
+            |(mut events, done, translator, thread_key_for_log)| async move {
+                if done {
+                    return None;
+                }
+                let result = events.as_mut().next().await?;
+                let thread_key = thread_key_for_log.clone();
+                let (events_out, done) = match result {
+                    Ok(event) => {
+                        let done = is_terminal_session_event(&event);
+                        let events = translator
+                            .lock()
+                            .expect("Anthropic translator mutex poisoned")
+                            .translate_session_event(&event)
+                            .into_iter()
+                            .map(|event| Ok(event.into_sse_event()))
+                            .collect::<Vec<Result<Event, Infallible>>>();
+                        (events, done)
+                    }
+                    Err(error) => {
+                        tracing::error!(
+                            thread_key = %thread_key,
+                            error = %error_chain(&error),
+                            "session event stream failed"
+                        );
+                        (
+                            vec![Ok(
+                                error_event("api_error", "event stream failed").into_sse_event()
+                            )],
+                            true,
+                        )
+                    }
+                };
+                Some((events_out, (events, done, translator, thread_key_for_log)))
+            },
+        )
+        .flat_map(stream::iter);
+        return Ok(Sse::new(stream)
+            .keep_alive(KeepAlive::default())
+            .into_response());
+    }
+
+    let message = collect_non_streaming_message(events, message_id, request.model).await?;
+    Ok(Json(message).into_response())
+}
+
+fn thread_key_from_headers(headers: &HeaderMap) -> Result<ThreadKey, AnthropicHttpError> {
+    let Some(value) = headers.get(THREAD_KEY_HEADER) else {
+        return ThreadKey::parse(format!("api:{}", Uuid::new_v4()))
+            .map_err(|error| AnthropicHttpError::bad_request(error.to_string()));
+    };
+    let value = value
+        .to_str()
+        .map_err(|_| AnthropicHttpError::bad_request("X-Centaur-Thread-Key must be valid UTF-8"))?;
+    ThreadKey::parse(value.to_owned())
+        .map_err(|error| AnthropicHttpError::bad_request(error.to_string()))
+}
+
+fn trailing_user_message(
+    request: &AnthropicMessagesRequest,
+) -> Result<&AnthropicInputMessage, AnthropicHttpError> {
+    let Some(message) = request.messages.last() else {
+        return Err(AnthropicHttpError::bad_request(
+            "messages must not be empty",
+        ));
+    };
+    if message.role != "user" {
+        return Err(AnthropicHttpError::bad_request(
+            "the trailing message must have role \"user\"",
+        ));
+    }
+    Ok(message)
+}
+
+fn input_parts(message: &AnthropicInputMessage) -> Vec<Value> {
+    match &message.content {
+        AnthropicInputContent::Text(text) => vec![json!({"type": "text", "text": text})],
+        AnthropicInputContent::Blocks(blocks) => blocks.clone(),
+    }
+}
+
+async fn collect_non_streaming_message<S>(
+    events: S,
+    message_id: String,
+    model: String,
+) -> Result<AnthropicMessage, AnthropicHttpError>
+where
+    S: futures_util::Stream<
+            Item = Result<
+                centaur_session_core::SessionEvent,
+                centaur_session_runtime::SessionRuntimeError,
+            >,
+        >,
+{
+    futures_util::pin_mut!(events);
+    let mut translator = AnthropicTranslator::new(message_id.clone(), model.clone());
+    let mut failure = None;
+    while let Some(result) = events.next().await {
+        let event = result.map_err(AnthropicHttpError::internal)?;
+        if event.event_type == "session.execution_failed" {
+            failure = Some(
+                event
+                    .payload
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("execution failed")
+                    .to_owned(),
+            );
+        }
+        let _ = translator.translate_session_event(&event);
+        if is_terminal_session_event(&event) {
+            break;
+        }
+    }
+    if let Some(message) = failure {
+        return Err(AnthropicHttpError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            error_type: "api_error",
+            message,
+        });
+    }
+
+    let mut content = translator.content();
+    if content.is_empty()
+        && let Some(result_text) = translator.terminal_result_text()
+        && !result_text.trim().is_empty()
+    {
+        content.push(json!({"type": "text", "text": result_text}));
+    }
+    Ok(AnthropicMessage {
+        id: message_id,
+        kind: "message",
+        role: "assistant",
+        model,
+        content,
+        stop_reason: Some("end_turn".to_owned()),
+        stop_sequence: None,
+        usage: AnthropicUsage {
+            input_tokens: 0,
+            output_tokens: 0,
+        },
+    })
+}
+
+fn is_terminal_session_event(event: &SessionEvent) -> bool {
+    matches!(
+        event.event_type.as_str(),
+        "session.execution_completed" | "session.execution_failed"
+    )
+}

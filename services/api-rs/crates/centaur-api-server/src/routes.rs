@@ -41,7 +41,7 @@ use tower_http::trace::TraceLayer;
 use tracing::Span;
 
 use crate::{
-    ApiError,
+    ApiError, anthropic,
     types::{
         AppendMessagesRequest, AppendMessagesResponse, CreateSessionRequest, CreateSessionResponse,
         EmitWorkflowEventRequest, EventsQuery, ExecuteSessionRequest, ExecuteSessionResponse,
@@ -95,13 +95,13 @@ impl AppState {
         self.initialized().is_some()
     }
 
-    fn runtime(&self) -> Result<SessionRuntime, ApiError> {
+    pub(crate) fn runtime(&self) -> Result<SessionRuntime, ApiError> {
         self.initialized()
             .map(|initialized| initialized.runtime)
             .ok_or_else(|| ApiError::ServiceUnavailable("api-rs is still starting".to_owned()))
     }
 
-    fn workflows(&self) -> Result<WorkflowRuntime, ApiError> {
+    pub(crate) fn workflows(&self) -> Result<WorkflowRuntime, ApiError> {
         let initialized = self
             .initialized()
             .ok_or_else(|| ApiError::ServiceUnavailable("api-rs is still starting".to_owned()))?;
@@ -144,6 +144,10 @@ pub fn build_router_with_app_state(state: AppState) -> Router {
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
         .route("/metrics", get(metrics))
+        .route(
+            "/v1/messages",
+            post(anthropic::anthropic_messages).layer(DefaultBodyLimit::disable()),
+        )
         .route(
             "/api/session/{thread_key}",
             post(create_or_get_session).get(get_session_context),

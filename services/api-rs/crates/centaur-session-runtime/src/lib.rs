@@ -2714,7 +2714,7 @@ fn tool_labels_from_item(item: &Value) -> Option<ToolCallLabels> {
             name: string_at_path(item, &["tool"]).unwrap_or_else(|| "agent".to_owned()),
             method: "call".to_owned(),
         }),
-        _ => None,
+        _ => centaur_call_labels_from_command_item(item),
     }
 }
 
@@ -2783,7 +2783,8 @@ fn progress_item_id(value: &Value) -> Option<String> {
     .next()
 }
 
-fn anthropic_tool_uses(value: &Value) -> Vec<&Value> {
+/// Extract Anthropic tool_use blocks; reused by api-server Anthropic translator.
+pub fn anthropic_tool_uses(value: &Value) -> Vec<&Value> {
     if value.get("type").and_then(Value::as_str) != Some("assistant") {
         return Vec::new();
     }
@@ -2793,7 +2794,8 @@ fn anthropic_tool_uses(value: &Value) -> Vec<&Value> {
         .collect()
 }
 
-fn anthropic_tool_results(value: &Value) -> Vec<&Value> {
+/// Extract Anthropic tool_result blocks; reused by api-server Anthropic translator.
+pub fn anthropic_tool_results(value: &Value) -> Vec<&Value> {
     if !matches!(
         value.get("type").and_then(Value::as_str),
         Some("user" | "tool")
@@ -2809,7 +2811,8 @@ fn anthropic_tool_results(value: &Value) -> Vec<&Value> {
         .collect()
 }
 
-fn content_blocks(value: &Value) -> Vec<&Value> {
+/// Extract Anthropic content blocks; reused by api-server Anthropic translator.
+pub fn content_blocks(value: &Value) -> Vec<&Value> {
     value
         .get("content")
         .or_else(|| {
@@ -2822,8 +2825,63 @@ fn content_blocks(value: &Value) -> Vec<&Value> {
         .unwrap_or_default()
 }
 
+fn centaur_call_labels_from_command_item(item: &Value) -> Option<ToolCallLabels> {
+    let command = string_at_path(item, &["command"])?;
+    let (name, method) = parse_centaur_call_command(&command)?;
+    Some(ToolCallLabels {
+        kind: "centaur_call".to_owned(),
+        name,
+        method,
+    })
+}
+
+fn parse_centaur_call_command(command: &str) -> Option<(String, String)> {
+    let call_start = command
+        .match_indices("call")
+        .find_map(|(index, _)| is_call_command_token(command, index).then_some(index))?;
+    let after_call = command[call_start + "call".len()..]
+        .trim_start_matches(|ch: char| ch.is_whitespace() || ch == '\'' || ch == '"');
+    let mut parts = after_call
+        .split(|ch: char| ch.is_whitespace() || matches!(ch, '\'' | '"' | ';'))
+        .filter(|part| !part.is_empty());
+    let first = parts.next()?;
+    match first {
+        "tools" => Some(("tools".to_owned(), "list".to_owned())),
+        "discover" => Some((
+            parts.next().unwrap_or("unknown").to_owned(),
+            "discover".to_owned(),
+        )),
+        "agent" => Some((
+            "agent".to_owned(),
+            parts.next().unwrap_or("unknown").to_owned(),
+        )),
+        tool => Some((
+            tool.to_owned(),
+            parts.next().unwrap_or("unknown").to_owned(),
+        )),
+    }
+}
+
+fn is_call_command_token(command: &str, index: usize) -> bool {
+    let before = command[..index].chars().next_back();
+    let after = command[index + "call".len()..].chars().next();
+
+    let before_is_boundary = before.is_none_or(|ch| {
+        ch.is_whitespace()
+            || matches!(
+                ch,
+                '\'' | '"' | '`' | ';' | '&' | '|' | '(' | ')' | '{' | '}' | '/'
+            )
+    });
+    let after_is_boundary =
+        after.is_some_and(|ch| ch.is_whitespace() || matches!(ch, '\'' | '"' | ';'));
+
+    before_is_boundary && after_is_boundary
+}
+
+/// Parsed terminal harness output; reused by api-server Anthropic translator.
 #[derive(Debug, Eq, PartialEq)]
-enum TerminalOutput {
+pub enum TerminalOutput {
     Completed {
         reason: &'static str,
         result_text: Option<String>,
@@ -3216,7 +3274,8 @@ fn is_event_stream_attach_race(error: &SessionRuntimeError) -> bool {
     )
 }
 
-fn terminal_output(value: &Value, prior_final_answer_text: &str) -> Option<TerminalOutput> {
+/// Parse terminal harness output; reused by api-server Anthropic translator.
+pub fn terminal_output(value: &Value, prior_final_answer_text: &str) -> Option<TerminalOutput> {
     let method = value.get("method").and_then(Value::as_str);
     let event_type = value.get("type").and_then(Value::as_str);
 
@@ -3309,12 +3368,15 @@ fn turn_completion_status(value: &Value) -> Option<String> {
     .next()
 }
 
-enum FinalAnswerTextUpdate {
+/// Parsed final-answer text update; reused by api-server Anthropic translator.
+#[derive(Debug, Eq, PartialEq)]
+pub enum FinalAnswerTextUpdate {
     Append(String),
     Replace(String),
 }
 
-fn output_line_final_answer_text(value: &Value) -> Option<FinalAnswerTextUpdate> {
+/// Parse final-answer text updates; reused by api-server Anthropic translator.
+pub fn output_line_final_answer_text(value: &Value) -> Option<FinalAnswerTextUpdate> {
     let method = value.get("method").and_then(Value::as_str);
     let event_type = value.get("type").and_then(Value::as_str);
     if matches!(method, Some("item/agentMessage/delta"))
@@ -3374,7 +3436,8 @@ fn item_ids(value: &Value) -> Vec<String> {
     .collect()
 }
 
-fn string_at_path(value: &Value, path: &[&str]) -> Option<String> {
+/// Read a non-empty string at a nested object path; reused by api-server Anthropic translator.
+pub fn string_at_path(value: &Value, path: &[&str]) -> Option<String> {
     let mut current = value;
     for key in path {
         current = current.get(*key)?;
@@ -3404,7 +3467,8 @@ fn terminal_error_text(value: &Value) -> String {
         .if_empty("terminal harness output reported failure")
 }
 
-fn terminal_payload_text(value: &Value) -> String {
+/// Extract text from common terminal payload shapes; reused by api-server Anthropic translator.
+pub fn terminal_payload_text(value: &Value) -> String {
     match value {
         Value::String(text) => text.clone(),
         Value::Array(values) => values

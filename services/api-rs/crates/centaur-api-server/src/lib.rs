@@ -1,3 +1,4 @@
+mod anthropic;
 pub mod client;
 mod error;
 mod routes;
@@ -28,10 +29,18 @@ mod tests {
     };
     use centaur_session_runtime::SandboxRuntime;
     use centaur_session_sqlx::PgSessionStore;
+    use centaur_session_sqlx::SessionStoreError;
+    use serde_json::{Value, json};
     use sqlx::PgPool;
+    use tokio::{
+        io::{AsyncWriteExt, DuplexStream},
+        sync::Mutex,
+    };
     use tower::ServiceExt;
 
     use super::{AppState, build_router_with_app_state, build_router_with_runtime};
+
+    static DB_TEST_LOCK: Mutex<()> = Mutex::const_new(());
 
     #[tokio::test]
     async fn router_builds() {
@@ -329,6 +338,148 @@ mod tests {
         assert!(body.get("slack").is_none());
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn anthropic_messages_streams_sse_from_scripted_stdout() {
+        let _lock = DB_TEST_LOCK.lock().await;
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let app = anthropic_test_app(
+            store,
+            vec![
+                json!({"type":"assistant","message":{"content":[{"type":"text","text":"PONG"}]}})
+                    .to_string(),
+                json!({"type":"result","result":"PONG"}).to_string(),
+            ],
+        );
+        let thread_key = format!("api-test:{}", uuid::Uuid::new_v4());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("X-Centaur-Thread-Key", thread_key)
+                    .body(Body::from(
+                        json!({
+                            "model": "claude-test",
+                            "max_tokens": 16,
+                            "stream": true,
+                            "messages": [{"role": "user", "content": "ping"}]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        let events = sse_event_names(&body);
+        assert_eq!(
+            events,
+            vec![
+                "message_start",
+                "ping",
+                "content_block_start",
+                "content_block_delta",
+                "content_block_stop",
+                "message_delta",
+                "message_stop",
+            ]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn anthropic_messages_returns_non_streaming_message() {
+        let _lock = DB_TEST_LOCK.lock().await;
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let app = anthropic_test_app(
+            store,
+            vec![
+                json!({"type":"assistant","message":{"content":[{"type":"text","text":"PONG"}]}})
+                    .to_string(),
+                json!({"type":"result","result":"PONG"}).to_string(),
+            ],
+        );
+        let thread_key = format!("api-test:{}", uuid::Uuid::new_v4());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("X-Centaur-Thread-Key", thread_key)
+                    .body(Body::from(
+                        json!({
+                            "model": "claude-test",
+                            "max_tokens": 16,
+                            "messages": [{"role": "user", "content": "ping"}]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["type"], json!("message"));
+        assert_eq!(value["role"], json!("assistant"));
+        assert_eq!(value["model"], json!("claude-test"));
+        assert_eq!(value["content"], json!([{"type": "text", "text": "PONG"}]));
+        assert_eq!(value["stop_reason"], json!("end_turn"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn anthropic_messages_generates_thread_key_when_header_absent() {
+        let _lock = DB_TEST_LOCK.lock().await;
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let app = anthropic_test_app(
+            store,
+            vec![
+                json!({"type":"assistant","message":{"content":[{"type":"text","text":"PONG"}]}})
+                    .to_string(),
+                json!({"type":"result","result":"PONG"}).to_string(),
+            ],
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/messages")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "model": "claude-test",
+                            "max_tokens": 16,
+                            "messages": [{"role": "user", "content": "ping"}]
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            value["id"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("msg_"))
+        );
+    }
+
     #[derive(Default)]
     struct TestBackend {
         next_id: AtomicU64,
@@ -385,5 +536,122 @@ mod tests {
                 operation: "resume",
             })
         }
+    }
+
+    struct ScriptedStdoutBackend {
+        next_id: AtomicU64,
+        script: Mutex<Vec<String>>,
+    }
+
+    impl ScriptedStdoutBackend {
+        fn new(script: Vec<String>) -> Self {
+            Self {
+                next_id: AtomicU64::new(0),
+                script: Mutex::new(script),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl SandboxBackend for ScriptedStdoutBackend {
+        fn name(&self) -> &'static str {
+            "scripted"
+        }
+
+        async fn create(&self, _spec: SandboxSpec) -> SandboxResult<SandboxHandle> {
+            let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
+            Ok(SandboxHandle::new(
+                SandboxId::new(format!("scripted-{id}")),
+                self.name(),
+            ))
+        }
+
+        async fn open_io(&self, _id: &SandboxId) -> SandboxResult<SandboxIo> {
+            let script = self.script.lock().await.clone();
+            let (io, mut stdout, mut stdin) = mock_io();
+            tokio::spawn(async move {
+                let _ = tokio::io::copy(&mut stdin, &mut tokio::io::sink()).await;
+            });
+            tokio::spawn(async move {
+                for line in script {
+                    let _ = stdout.write_all(line.as_bytes()).await;
+                    let _ = stdout.write_all(b"\n").await;
+                }
+            });
+            Ok(io)
+        }
+
+        async fn status(&self, _id: &SandboxId) -> SandboxResult<SandboxStatus> {
+            Ok(SandboxStatus::Running)
+        }
+
+        async fn observe(&self, id: &SandboxId) -> SandboxResult<ObservedSandbox> {
+            Ok(ObservedSandbox::new(
+                id.clone(),
+                self.name(),
+                SandboxStatus::Running,
+            ))
+        }
+
+        async fn list_observed(&self) -> SandboxResult<Vec<ObservedSandbox>> {
+            Ok(Vec::new())
+        }
+
+        async fn stop(&self, _id: &SandboxId) -> SandboxResult<()> {
+            Ok(())
+        }
+
+        async fn pause(&self, _id: &SandboxId) -> SandboxResult<()> {
+            Ok(())
+        }
+
+        async fn resume(&self, _id: &SandboxId) -> SandboxResult<()> {
+            Ok(())
+        }
+    }
+
+    fn mock_io() -> (SandboxIo, DuplexStream, DuplexStream) {
+        let (stdin_near, stdin_far) = tokio::io::duplex(64 * 1024);
+        let (stdout_near, stdout_far) = tokio::io::duplex(64 * 1024);
+        let (stderr_near, _stderr_far) = tokio::io::duplex(1024);
+        let io = SandboxIo::new(
+            Box::pin(stdin_near),
+            Box::pin(stdout_near),
+            Box::pin(stderr_near),
+        );
+        (io, stdout_far, stdin_far)
+    }
+
+    async fn test_store() -> Option<PgSessionStore> {
+        let Ok(url) = std::env::var("SESSION_RUNTIME_TEST_DATABASE_URL") else {
+            eprintln!("skipping: SESSION_RUNTIME_TEST_DATABASE_URL not set");
+            return None;
+        };
+        let store = PgSessionStore::connect(&url)
+            .await
+            .expect("connect test db");
+        match store.run_migrations().await {
+            Ok(()) => Some(store),
+            Err(SessionStoreError::Sqlx(error)) => panic!("run migrations: {error}"),
+            Err(error) => panic!("run migrations: {error}"),
+        }
+    }
+
+    fn anthropic_test_app(store: PgSessionStore, script: Vec<String>) -> axum::Router {
+        build_router_with_runtime(
+            store,
+            SandboxRuntime::backend(
+                Arc::new(ScriptedStdoutBackend::new(script)),
+                SandboxSpec::new("scripted"),
+            ),
+        )
+    }
+
+    fn sse_event_names(body: &str) -> Vec<&str> {
+        body.lines()
+            .filter_map(|line| line.strip_prefix("event:"))
+            .map(str::trim)
+            .filter(|event| !event.is_empty())
+            .collect()
     }
 }
