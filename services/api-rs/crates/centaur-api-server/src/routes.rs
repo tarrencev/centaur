@@ -52,7 +52,7 @@ use tracing::Span;
 use uuid::Uuid;
 
 use crate::{
-    ApiError,
+    ApiError, anthropic,
     types::{
         AppendMessagesRequest, AppendMessagesResponse, CreateSessionRequest, CreateSessionResponse,
         EmitWorkflowEventRequest, EventsQuery, ExecuteSessionRequest, ExecuteSessionResponse,
@@ -124,13 +124,13 @@ impl AppState {
         self.initialized().is_some()
     }
 
-    fn runtime(&self) -> Result<SessionRuntime, ApiError> {
+    pub(crate) fn runtime(&self) -> Result<SessionRuntime, ApiError> {
         self.initialized()
             .map(|initialized| initialized.runtime)
             .ok_or_else(|| ApiError::ServiceUnavailable("api-rs is still starting".to_owned()))
     }
 
-    fn workflows(&self) -> Result<WorkflowRuntime, ApiError> {
+    pub(crate) fn workflows(&self) -> Result<WorkflowRuntime, ApiError> {
         let initialized = self
             .initialized()
             .ok_or_else(|| ApiError::ServiceUnavailable("api-rs is still starting".to_owned()))?;
@@ -188,6 +188,10 @@ pub fn build_router_with_app_state(state: AppState) -> Router {
         .route("/readyz", get(readyz))
         .route("/metrics", get(metrics))
         .route("/api/personas", get(list_personas))
+        .route(
+            "/v1/messages",
+            post(anthropic::anthropic_messages).layer(DefaultBodyLimit::disable()),
+        )
         .route(
             "/api/session/{thread_key}",
             post(create_or_get_session).get(get_session_context),
@@ -426,6 +430,8 @@ async fn execute_session(
                 input_lines: request.input_lines,
                 idle_timeout_ms: request.idle_timeout_ms,
                 max_duration_ms: request.max_duration_ms,
+                model: None,
+                system_prompt: None,
             },
         )
         .await?;
