@@ -80,5 +80,26 @@ class CopyPublishedToolsTest(unittest.TestCase):
             self.assertTrue((target / "productivity" / "linear" / "pyproject.toml").exists())
 
 
+    def test_discover_scripts_respects_allowlist(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "tools"
+            for category, name in (("research", "websearch"), ("productivity", "linear")):
+                d = root / category / name
+                d.mkdir(parents=True)
+                (d / "pyproject.toml").write_text(
+                    f'[project]\nname = "{name}"\n\n[project.scripts]\n{name} = "client:main"\n'
+                )
+
+            with mock.patch.dict("os.environ", {"TOOL_ALLOWLIST": "websearch,posthog"}):
+                scripts = install_tool_shims._discover_scripts([root])
+            self.assertIn("websearch", scripts)
+            self.assertNotIn("linear", scripts)
+
+            with mock.patch.dict("os.environ", {"TOOL_ALLOWLIST": ""}):
+                scripts_all = install_tool_shims._discover_scripts([root])
+            self.assertIn("websearch", scripts_all)
+            self.assertIn("linear", scripts_all)
+
+
 if __name__ == "__main__":
     unittest.main()

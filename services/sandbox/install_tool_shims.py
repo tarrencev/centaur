@@ -336,6 +336,7 @@ def _refresh_skill_dirs(workspace_dir: Path) -> int:
 
 
 def _discover_scripts(tool_dirs: list[Path]) -> dict[str, dict[str, str]]:
+    allowlist = _tool_allowlist()
     scripts: dict[str, dict[str, str]] = {}
     for tool_dir in tool_dirs:
         if not tool_dir.is_dir():
@@ -352,6 +353,12 @@ def _discover_scripts(tool_dirs: list[Path]) -> dict[str, dict[str, str]]:
                 print(f"warning: failed to read {pyproject}: {exc}", file=sys.stderr)
                 continue
             project = data.get("project") or {}
+            # Only shim allowlisted tools (by package dir or project name) so the
+            # agent's catalog is exactly the configured tools. Unset -> shim all.
+            if allowlist is not None and allowlist.isdisjoint(
+                {pyproject.parent.name, str(project.get("name") or "")}
+            ):
+                continue
             project_scripts = project.get("scripts") or {}
             if not isinstance(project_scripts, dict):
                 continue
