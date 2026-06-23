@@ -21,6 +21,20 @@ def _split_paths(value: str) -> list[Path]:
     return [Path(part) for part in value.split(":") if part]
 
 
+def _tool_allowlist() -> set[str] | None:
+    """Tool package names to install, from ``TOOL_ALLOWLIST``.
+
+    Returns ``None`` when unset/empty -> install every mounted tool (backward
+    compatible). When set, only tools whose package name is listed are installed,
+    so the sandbox catalog is exactly the configured tools and the agent neither
+    sees nor wastes context on unconfigured ones (which also lack credentials).
+    """
+    raw = os.environ.get("TOOL_ALLOWLIST", "").strip()
+    if not raw:
+        return None
+    return {name.strip() for name in raw.split(",") if name.strip()}
+
+
 def _home_dir() -> Path:
     return Path.home()
 
@@ -83,9 +97,14 @@ def _copy_published_tools(tool_dir: Path, published: Path) -> None:
     if not published.is_dir():
         raise RuntimeError(f"refreshed tools subdir does not exist: {published}")
 
+    allowlist = _tool_allowlist()
     existing = {package_dir.name: package_dir for package_dir in _tool_package_dirs(tool_dir)}
     for package_dir in _tool_package_dirs(published):
         tool_name = package_dir.name
+        if allowlist is not None and tool_name not in allowlist:
+            # Not in TOOL_ALLOWLIST -> don't install; keeps the agent's catalog
+            # to configured tools (no phantom, credential-less tools).
+            continue
         if tool_name in existing:
             print(
                 f"skipping duplicate tool {tool_name}: {package_dir} conflicts with {existing[tool_name]}",
