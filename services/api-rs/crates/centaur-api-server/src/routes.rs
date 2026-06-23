@@ -53,7 +53,7 @@ use tracing::Span;
 use uuid::Uuid;
 
 use crate::{
-    ApiError, anthropic,
+    ApiError, anthropic, openai,
     types::{
         AppendMessagesRequest, AppendMessagesResponse, CreateSessionRequest, CreateSessionResponse,
         EmitWorkflowEventRequest, EventsQuery, ExecuteSessionRequest, ExecuteSessionResponse,
@@ -192,6 +192,10 @@ pub fn build_router_with_app_state(state: AppState) -> Router {
         .route(
             "/v1/messages",
             post(anthropic::anthropic_messages).layer(DefaultBodyLimit::disable()),
+        )
+        .route(
+            "/v1/responses",
+            post(openai::create_response).layer(DefaultBodyLimit::disable()),
         )
         .route(
             "/api/session/{thread_key}",
