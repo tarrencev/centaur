@@ -5,6 +5,7 @@ import io
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import install_tool_shims
 
@@ -44,6 +45,60 @@ class CopyPublishedToolsTest(unittest.TestCase):
             self.assertEqual((target / "research" / "websearch" / "old.py").read_text(), "old\n")
             self.assertFalse((target / "research" / "websearch" / "new.py").exists())
             self.assertEqual((target / "research" / "company" / "pyproject.toml").read_text(), "company\n")
+
+    def test_tool_allowlist_restricts_installed_tools(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            published = root / "published"
+            target = root / "target"
+
+            for category, name in (("research", "websearch"), ("productivity", "linear")):
+                (published / category / name).mkdir(parents=True)
+                (published / category / name / "pyproject.toml").write_text(f"{name}\n")
+
+            with mock.patch.dict("os.environ", {"TOOL_ALLOWLIST": "websearch,posthog"}):
+                install_tool_shims._copy_published_tools(target, published)
+
+            # Allowlisted tool installed; unconfigured tool skipped.
+            self.assertTrue((target / "research" / "websearch" / "pyproject.toml").exists())
+            self.assertFalse((target / "productivity" / "linear").exists())
+
+    def test_unset_allowlist_installs_all_tools(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            published = root / "published"
+            target = root / "target"
+
+            for category, name in (("research", "websearch"), ("productivity", "linear")):
+                (published / category / name).mkdir(parents=True)
+                (published / category / name / "pyproject.toml").write_text(f"{name}\n")
+
+            with mock.patch.dict("os.environ", {"TOOL_ALLOWLIST": ""}):
+                install_tool_shims._copy_published_tools(target, published)
+
+            self.assertTrue((target / "research" / "websearch" / "pyproject.toml").exists())
+            self.assertTrue((target / "productivity" / "linear" / "pyproject.toml").exists())
+
+
+    def test_discover_scripts_respects_allowlist(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "tools"
+            for category, name in (("research", "websearch"), ("productivity", "linear")):
+                d = root / category / name
+                d.mkdir(parents=True)
+                (d / "pyproject.toml").write_text(
+                    f'[project]\nname = "{name}"\n\n[project.scripts]\n{name} = "client:main"\n'
+                )
+
+            with mock.patch.dict("os.environ", {"TOOL_ALLOWLIST": "websearch,posthog"}):
+                scripts = install_tool_shims._discover_scripts([root])
+            self.assertIn("websearch", scripts)
+            self.assertNotIn("linear", scripts)
+
+            with mock.patch.dict("os.environ", {"TOOL_ALLOWLIST": ""}):
+                scripts_all = install_tool_shims._discover_scripts([root])
+            self.assertIn("websearch", scripts_all)
+            self.assertIn("linear", scripts_all)
 
 
 if __name__ == "__main__":
