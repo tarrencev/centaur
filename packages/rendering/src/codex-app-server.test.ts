@@ -205,30 +205,86 @@ describe('CodexAppServerRendererEventMapper', () => {
     )
   })
 
-  it('separates Codex reasoning summary sections within one Thinking task', () => {
+  it('renders each Codex reasoning summary section as its own Thinking card', () => {
+    const mapper = new CodexAppServerRendererEventMapper()
+
+    const first = mapper.process({
+      type: 'item.reasoning.summaryTextDelta',
+      itemId: 'reasoning-1',
+      summaryIndex: 0,
+      delta: 'First section.'
+    })
+    const second = mapper.process({
+      type: 'item.reasoning.summaryTextDelta',
+      itemId: 'reasoning-1',
+      summaryIndex: 1,
+      delta: 'Second section.'
+    })
+
+    expect(first.find(event => event.type === 'renderer.task.update')).toMatchObject({
+      task: {
+        id: 'reasoning-1#0',
+        title: 'Thinking',
+        status: 'in_progress',
+        details: [{ type: 'text', text: 'First section.' }]
+      }
+    })
+    // The second section is a distinct card; it does not append to the first.
+    const secondUpdate = second.find(
+      event =>
+        event.type === 'renderer.task.update' && event.task.id === 'reasoning-1#1'
+    )
+    expect(secondUpdate).toMatchObject({
+      task: {
+        id: 'reasoning-1#1',
+        title: 'Thinking',
+        status: 'in_progress',
+        details: [{ type: 'text', text: 'Second section.' }]
+      }
+    })
+  })
+
+  it('interleaves reasoning summary sections with commands and seals all sections', () => {
     const mapper = new CodexAppServerRendererEventMapper()
 
     mapper.process({
       type: 'item.reasoning.summaryTextDelta',
       itemId: 'reasoning-1',
       summaryIndex: 0,
-      delta: 'First section.'
+      delta: 'Looking at the patch.'
     })
-    const events = mapper.process({
+    mapper.process({
+      type: 'item.started',
+      item: { id: 'cmd-1', type: 'commandExecution', command: 'git status' }
+    })
+    // A second section arrives after the command — it must land in a fresh
+    // card inserted after the command, preserving chronological order.
+    mapper.process({
       type: 'item.reasoning.summaryTextDelta',
       itemId: 'reasoning-1',
       summaryIndex: 1,
-      delta: 'Second section.'
+      delta: 'Now committing.'
     })
-    const update = events.find(event => event.type === 'renderer.task.update')
-    expect(update).toMatchObject({
-      task: {
+
+    const sealed = mapper.process({
+      type: 'item.completed',
+      item: {
         id: 'reasoning-1',
-        title: 'Thinking',
-        status: 'in_progress',
-        details: [{ type: 'text', text: 'First section.\n\nSecond section.' }]
+        type: 'reasoning',
+        summary: ['Looking at the patch.', 'Now committing.']
       }
     })
+    const sealedUpdates = sealed
+      .filter(event => event.type === 'renderer.task.update')
+      .map(event => (event.type === 'renderer.task.update' ? event.task : null))
+    // Sealing completes both sections. (Section text already streamed during
+    // the in_progress deltas, so the seal update carries only the status flip.)
+    expect(sealedUpdates).toContainEqual(
+      expect.objectContaining({ id: 'reasoning-1#0', status: 'complete' })
+    )
+    expect(sealedUpdates).toContainEqual(
+      expect.objectContaining({ id: 'reasoning-1#1', status: 'complete' })
+    )
   })
 
   it('parses Rust session output lines before mapping app-server notifications', () => {
@@ -410,14 +466,14 @@ describe('CodexAppServerRendererEventMapper', () => {
     })
     expect(chunks).toContainEqual({
       type: 'task_update',
-      id: 'reasoning-1',
+      id: 'reasoning-1#0',
       title: 'Thinking',
       status: 'in_progress',
       details: 'Inspecting the event stream'
     })
     expect(chunks).toContainEqual({
       type: 'task_update',
-      id: 'reasoning-1',
+      id: 'reasoning-1#0',
       title: 'Thinking',
       status: 'complete'
     })
