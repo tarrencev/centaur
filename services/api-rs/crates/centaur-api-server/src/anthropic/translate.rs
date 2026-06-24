@@ -38,6 +38,9 @@ pub struct AnthropicTranslator {
     next_index: usize,
     open_block: Option<OpenBlock>,
     emitted_text: String,
+    /// Text streamed for the current agentMessage item only, so an `item.completed`
+    /// dedups against its own deltas rather than the global accumulator.
+    item_text: String,
     final_answer_text: String,
     terminal_result_text: Option<String>,
     content: Vec<Value>,
@@ -53,6 +56,7 @@ impl AnthropicTranslator {
             next_index: 0,
             open_block: None,
             emitted_text: String::new(),
+            item_text: String::new(),
             final_answer_text: String::new(),
             terminal_result_text: None,
             content: Vec::new(),
@@ -196,6 +200,7 @@ impl AnthropicTranslator {
                     && !delta.is_empty()
                 {
                     self.emit_text_delta(delta, out);
+                    self.item_text.push_str(delta);
                 }
             }
             "item.completed" => {
@@ -214,15 +219,21 @@ impl AnthropicTranslator {
     }
 
     fn emit_replacement_text(&mut self, full_text: &str, out: &mut Vec<AnthropicStreamEvent>) {
-        if let Some(suffix) = full_text.strip_prefix(&self.emitted_text) {
-            if !suffix.is_empty() {
-                self.emit_text_delta(suffix, out);
+        // Dedup against THIS item's streamed deltas, not the global accumulator,
+        // so a multi-message turn (the agent narrates between tool calls) doesn't
+        // re-emit each completed message as duplicated output.
+        let suffix = full_text.strip_prefix(self.item_text.as_str());
+        self.item_text.clear();
+        match suffix {
+            Some(suffix) if !suffix.is_empty() => self.emit_text_delta(suffix, out),
+            Some(_) => {}
+            None => {
+                // Divergent within one item: emit as a fresh text block.
+                self.close_open_block(out);
+                self.open_text_block(out);
+                self.emit_text_delta(full_text, out);
             }
-            return;
         }
-        self.close_open_block(out);
-        self.open_text_block(out);
-        self.emit_text_delta(full_text, out);
     }
 
     fn emit_text_delta(&mut self, text: &str, out: &mut Vec<AnthropicStreamEvent>) {
