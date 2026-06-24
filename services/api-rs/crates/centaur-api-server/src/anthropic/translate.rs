@@ -199,6 +199,11 @@ impl AnthropicTranslator {
                 if let Some(delta) = params.get("delta").and_then(Value::as_str)
                     && !delta.is_empty()
                 {
+                    if self.item_text.is_empty() && !self.emitted_text.is_empty() {
+                        // New agentMessage after prior output: separate with a
+                        // blank line so narration and answer don't glue together.
+                        self.emit_text_delta("\n\n", out);
+                    }
                     self.emit_text_delta(delta, out);
                     self.item_text.push_str(delta);
                 }
@@ -222,10 +227,18 @@ impl AnthropicTranslator {
         // Dedup against THIS item's streamed deltas, not the global accumulator,
         // so a multi-message turn (the agent narrates between tool calls) doesn't
         // re-emit each completed message as duplicated output.
-        let suffix = full_text.strip_prefix(self.item_text.as_str());
+        let new_message = self.item_text.is_empty() && !self.emitted_text.is_empty();
+        let suffix = full_text
+            .strip_prefix(self.item_text.as_str())
+            .map(str::to_owned);
         self.item_text.clear();
         match suffix {
-            Some(suffix) if !suffix.is_empty() => self.emit_text_delta(suffix, out),
+            Some(suffix) if !suffix.is_empty() => {
+                if new_message {
+                    self.emit_text_delta("\n\n", out);
+                }
+                self.emit_text_delta(&suffix, out);
+            }
             Some(_) => {}
             None => {
                 // Divergent within one item: emit as a fresh text block.
