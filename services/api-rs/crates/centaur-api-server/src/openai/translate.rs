@@ -159,6 +159,7 @@ impl ResponsesTranslator {
                 if let Some(delta) = params.get("delta").and_then(Value::as_str)
                     && !delta.is_empty()
                 {
+                    self.separate_new_message(out);
                     self.emit_text_delta(delta, out);
                     self.item_text.push_str(delta);
                 }
@@ -183,11 +184,22 @@ impl ResponsesTranslator {
         // fail the prefix check and re-emit its whole message -> duplicated output.
         let suffix = full_text
             .strip_prefix(self.item_text.as_str())
-            .unwrap_or(full_text);
+            .unwrap_or(full_text)
+            .to_owned();
         if !suffix.is_empty() {
-            self.emit_text_delta(suffix, out);
+            self.separate_new_message(out);
+            self.emit_text_delta(&suffix, out);
         }
         self.item_text.clear();
+    }
+
+    /// Separate a new agentMessage from prior output with a blank line, so the
+    /// agent's narration and final answer don't glue together (e.g. the agent's
+    /// "...previous snapshot." running straight into "Current deployments: ...").
+    fn separate_new_message(&mut self, out: &mut Vec<ResponsesStreamEvent>) {
+        if self.item_text.is_empty() && !self.emitted_text.is_empty() {
+            self.emit_text_delta("\n\n", out);
+        }
     }
 
     fn emit_text_delta(&mut self, text: &str, out: &mut Vec<ResponsesStreamEvent>) {
@@ -499,7 +511,9 @@ mod tests {
             ),
             event("session.execution_completed", json!({})),
         ]);
-        assert_eq!(streamed_text(&out), "CheckingAnswer");
+        // Each message appears once (no duplication) and consecutive messages are
+        // separated by a blank line rather than glued ("Checking" + "Answer").
+        assert_eq!(streamed_text(&out), "Checking\n\nAnswer");
     }
 
     #[test]
