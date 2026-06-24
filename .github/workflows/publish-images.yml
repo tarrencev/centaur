@@ -230,3 +230,23 @@ jobs:
       - name: Inspect manifest
         run: |
           docker buildx imagetools inspect ${{ env.REGISTRY }}/${{ env.IMAGE_NAMESPACE }}/${{ matrix.image }}:${{ steps.meta.outputs.version }}
+
+  # Auto-deploy: once the canonical release branch's base images are published,
+  # tell the c7e overlay to roll them out (it gates on the `latitude`
+  # environment). Manual pin-bump + dispatch still works as a fallback.
+  notify-overlay:
+    needs: merge
+    if: github.event_name == 'push' && github.ref == 'refs/heads/release/c7e-centaur-overlay'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dispatch overlay deploy with the new base image sha
+        env:
+          GH_TOKEN: ${{ secrets.OVERLAY_DISPATCH_TOKEN }}
+        run: |
+          short="${GITHUB_SHA:0:7}"
+          gh api repos/cartridge-gg/agent/dispatches --method POST --input - <<EOF
+          {
+            "event_type": "base-images-published",
+            "client_payload": { "sha": "${GITHUB_SHA}", "tag": "sha-${short}", "ref": "${GITHUB_REF_NAME}" }
+          }
+          EOF
