@@ -37,6 +37,9 @@ pub struct ResponsesTranslator {
     started: bool,
     message_open: bool,
     emitted_text: String,
+    /// Text streamed for the current agentMessage item only, so an `item.completed`
+    /// dedups against its own deltas rather than the global accumulator.
+    item_text: String,
     final_answer_text: String,
     terminal_result_text: Option<String>,
     completed: bool,
@@ -54,6 +57,7 @@ impl ResponsesTranslator {
             started: false,
             message_open: false,
             emitted_text: String::new(),
+            item_text: String::new(),
             final_answer_text: String::new(),
             terminal_result_text: None,
             completed: false,
@@ -156,6 +160,7 @@ impl ResponsesTranslator {
                     && !delta.is_empty()
                 {
                     self.emit_text_delta(delta, out);
+                    self.item_text.push_str(delta);
                 }
             }
             "item.completed" => {
@@ -172,14 +177,17 @@ impl ResponsesTranslator {
     }
 
     fn emit_replacement_text(&mut self, full_text: &str, out: &mut Vec<ResponsesStreamEvent>) {
-        if let Some(suffix) = full_text.strip_prefix(&self.emitted_text) {
-            if !suffix.is_empty() {
-                self.emit_text_delta(suffix, out);
-            }
-            return;
+        // Dedup against THIS item's streamed deltas, not the global accumulator.
+        // A turn can contain several agentMessages (the agent narrates between
+        // tool calls); dedupping against the global text made every item.completed
+        // fail the prefix check and re-emit its whole message -> duplicated output.
+        let suffix = full_text
+            .strip_prefix(self.item_text.as_str())
+            .unwrap_or(full_text);
+        if !suffix.is_empty() {
+            self.emit_text_delta(suffix, out);
         }
-        // Divergent final text: emit the whole thing as a fresh delta.
-        self.emit_text_delta(full_text, out);
+        self.item_text.clear();
     }
 
     fn emit_text_delta(&mut self, text: &str, out: &mut Vec<ResponsesStreamEvent>) {
@@ -472,6 +480,26 @@ mod tests {
             completed.data["response"]["output"][0]["content"][0]["text"],
             json!("PONG")
         );
+    }
+
+    #[test]
+    fn multi_message_turn_does_not_duplicate() {
+        // The agent narrates between tool calls: a preamble agentMessage, then the
+        // answer. Each item.completed must dedup against its OWN deltas; dedupping
+        // against the global accumulator re-emitted the whole answer (stuttering).
+        let out = translate(vec![
+            event("session.execution_started", json!({})),
+            output(json!({"method":"item/agentMessage/delta","params":{"delta":"Checking"}})),
+            output(
+                json!({"method":"item/completed","params":{"item":{"type":"agentMessage","text":"Checking"}}}),
+            ),
+            output(json!({"method":"item/agentMessage/delta","params":{"delta":"Answer"}})),
+            output(
+                json!({"method":"item/completed","params":{"item":{"type":"agentMessage","text":"Answer"}}}),
+            ),
+            event("session.execution_completed", json!({})),
+        ]);
+        assert_eq!(streamed_text(&out), "CheckingAnswer");
     }
 
     #[test]
