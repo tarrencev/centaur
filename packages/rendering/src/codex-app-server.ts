@@ -59,8 +59,8 @@ type CodexMapperState = {
   agentMessagePhase: AgentMessagePhase | null
   agentMessagePhaseByItemId: Map<string, AgentMessagePhase>
   planText: string
-  reasoningTextByItemId: Map<string, string>
-  reasoningSummaryIndexByItemId: Map<string, number>
+  reasoningTextBySectionKey: Map<string, string>
+  reasoningSectionKeysByItemId: Map<string, string[]>
   taskByUseId: Map<string, HarnessTask>
   commandOutputById: Map<string, string>
   emittedActivityRunByTaskId: Map<string, string>
@@ -305,25 +305,28 @@ export class CodexAppServerRendererEventMapper
     if (reasoningMessage.trim()) {
       const itemId = reasoningEventItemId(event)
       if (isReasoningDeltaEvent(event) && itemId) {
-        // Accumulate deltas into one task per reasoning item and keep it
-        // in_progress until the item seals (item.completed) or the
-        // execution finishes (flush). Completing earlier makes the Slack
-        // plan card flip between "Thinking", "Thinking completed", and the
-        // running command.
-        const previous = this.state.reasoningTextByItemId.get(itemId) ?? ''
+        // One Thinking card per reasoning summary section. Codex streams a
+        // turn's reasoning as multiple summary sections (summaryIndex 0..n)
+        // under a single itemId, interleaved with command executions.
+        // Keying each section to its own card preserves that structure:
+        // separate bullets that interleave chronologically with commands,
+        // matching native codex. Deltas still accumulate per section, so the
+        // per-delta card explosion fixed earlier stays fixed. When
+        // summaryIndex is absent (Claude/Anthropic normalized path, which
+        // emits content_index 0), the key collapses to the itemId, so that
+        // path keeps a single card per reasoning item.
         const summaryIndex = reasoningSummaryIndex(event)
-        const needsBreak =
-          summaryIndex !== undefined &&
-          this.state.reasoningSummaryIndexByItemId.get(itemId) !== undefined &&
-          this.state.reasoningSummaryIndexByItemId.get(itemId) !== summaryIndex &&
-          previous.trim() !== ''
-        if (summaryIndex !== undefined) {
-          this.state.reasoningSummaryIndexByItemId.set(itemId, summaryIndex)
-        }
-        const accumulated = previous + (needsBreak ? '\n\n' : '') + reasoningMessage
-        this.state.reasoningTextByItemId.set(itemId, accumulated)
-        this.state.taskByUseId.set(itemId, {
-          id: itemId,
+        const sectionKey = summaryIndex !== undefined ? `${itemId}#${summaryIndex}` : itemId
+        const previous = this.state.reasoningTextBySectionKey.get(sectionKey) ?? ''
+        const accumulated = previous + reasoningMessage
+        this.state.reasoningTextBySectionKey.set(sectionKey, accumulated)
+        this.trackReasoningSection(itemId, sectionKey)
+        // Keep the section in_progress until the item seals (item.completed)
+        // or the execution finishes (flush). Completing earlier makes the
+        // Slack plan card flip between "Thinking", "Thinking completed", and
+        // the running command.
+        this.state.taskByUseId.set(sectionKey, {
+          id: sectionKey,
           title: 'Thinking',
           status: 'in_progress',
           details: [section([text(accumulated.trim())])],
@@ -345,20 +348,47 @@ export class CodexAppServerRendererEventMapper
     const sealedReasoning = completedReasoningItem(event)
     if (sealedReasoning) {
       const id = String(sealedReasoning.id ?? '')
-      const accumulated = id ? this.state.reasoningTextByItemId.get(id) ?? '' : ''
-      const finalText = (reasoningItemText(sealedReasoning) || accumulated).trim()
-      const existing = id ? this.state.taskByUseId.get(id) : undefined
-      if (id && (existing || finalText)) {
-        this.state.taskByUseId.set(id, {
-          id,
-          title: 'Thinking',
-          status: 'complete',
-          details: finalText ? [section([text(finalText)])] : existing?.details ?? [],
-          output: []
-        })
-        this.state.reasoningTextByItemId.delete(id)
-        this.state.reasoningSummaryIndexByItemId.delete(id)
+      const sectionKeys = id ? this.state.reasoningSectionKeysByItemId.get(id) : undefined
+      if (sectionKeys && sectionKeys.length) {
+        // Complete every streamed section of this item. Reconcile each
+        // section's text from the sealed summary parts when they line up
+        // 1:1 with the streamed sections; otherwise keep what streamed.
+        const parts = reasoningSummaryParts(sealedReasoning)
+        const aligned = parts.length === sectionKeys.length
+        for (const [index, key] of sectionKeys.entries()) {
+          const accumulated = this.state.reasoningTextBySectionKey.get(key) ?? ''
+          const finalText = ((aligned ? parts[index] : '') || accumulated).trim()
+          const existing = this.state.taskByUseId.get(key)
+          if (existing || finalText) {
+            this.state.taskByUseId.set(key, {
+              id: key,
+              title: 'Thinking',
+              status: 'complete',
+              details: finalText ? [section([text(finalText)])] : existing?.details ?? [],
+              output: []
+            })
+          }
+          this.state.reasoningTextBySectionKey.delete(key)
+        }
+        this.state.reasoningSectionKeysByItemId.delete(id)
         this.emitActivitySummary(out)
+      } else {
+        // Reasoning that only appears at seal (no streamed deltas): emit a
+        // single card from the sealed item text.
+        const accumulated = id ? this.state.reasoningTextBySectionKey.get(id) ?? '' : ''
+        const finalText = (reasoningItemText(sealedReasoning) || accumulated).trim()
+        const existing = id ? this.state.taskByUseId.get(id) : undefined
+        if (id && (existing || finalText)) {
+          this.state.taskByUseId.set(id, {
+            id,
+            title: 'Thinking',
+            status: 'complete',
+            details: finalText ? [section([text(finalText)])] : existing?.details ?? [],
+            output: []
+          })
+          this.state.reasoningTextBySectionKey.delete(id)
+          this.emitActivitySummary(out)
+        }
       }
     }
 
@@ -640,6 +670,15 @@ export class CodexAppServerRendererEventMapper
     })
   }
 
+  private trackReasoningSection(itemId: string, sectionKey: string): void {
+    const keys = this.state.reasoningSectionKeysByItemId.get(itemId)
+    if (!keys) {
+      this.state.reasoningSectionKeysByItemId.set(itemId, [sectionKey])
+      return
+    }
+    if (!keys.includes(sectionKey)) keys.push(sectionKey)
+  }
+
   private log(event: string, fields: Record<string, unknown>): void {
     this.logInfo?.(event, fields)
   }
@@ -772,8 +811,8 @@ function newState(): CodexMapperState {
     agentMessagePhase: null,
     agentMessagePhaseByItemId: new Map(),
     planText: '',
-    reasoningTextByItemId: new Map(),
-    reasoningSummaryIndexByItemId: new Map(),
+    reasoningTextBySectionKey: new Map(),
+    reasoningSectionKeysByItemId: new Map(),
     taskByUseId: new Map(),
     commandOutputById: new Map(),
     emittedActivityRunByTaskId: new Map(),
@@ -1019,6 +1058,13 @@ function completedReasoningItem(event: any): Record<string, any> | null {
   const item = event.item
   if (!item || item.type !== 'reasoning') return null
   return item
+}
+
+function reasoningSummaryParts(item: any): string[] {
+  const summary = Array.isArray(item?.summary) ? item.summary : []
+  return summary
+    .map((part: any) => (typeof part === 'string' ? part : String(part?.text ?? '')))
+    .map((part: string) => part.trim())
 }
 
 function reasoningItemText(item: any): string {
