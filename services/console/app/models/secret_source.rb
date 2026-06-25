@@ -3,7 +3,7 @@ class SecretSource < ApplicationRecord
 
   include SyncConfigOwnerInvalidation
 
-  SOURCE_TYPES = %w[env aws_sm aws_ssm 1password 1password_connect control_plane token_broker].freeze
+  SOURCE_TYPES = %w[env aws_sm aws_ssm 1password 1password_connect control_plane token_broker github_app].freeze
 
   UNIVERSAL_OPTIONAL = %w[json_key ttl].freeze
 
@@ -14,7 +14,11 @@ class SecretSource < ApplicationRecord
     "1password" => { required: %w[secret_ref], optional: %w[token_env] },
     "1password_connect" => { required: %w[secret_ref], optional: %w[host_env token_env] },
     "control_plane" => { required: [], optional: [] },
-    "token_broker" => { required: %w[credential_id], optional: %w[credential_namespace] }
+    "token_broker" => { required: %w[credential_id], optional: %w[credential_namespace] },
+    "github_app" => {
+      required: %w[app_id_env installation_id_env private_key_b64_env],
+      optional: %w[api_url early_refresh_seconds]
+    }
   }.freeze
 
   # A source belongs to exactly one owner. static_secret feeds the `secrets`
@@ -51,6 +55,7 @@ class SecretSource < ApplicationRecord
   # special handling for either). The credential reference never reaches the proxy.
   def to_proxy_source
     return { "type" => "control_plane", "value" => brokered_credential&.access_token } if source_type == "token_broker"
+    return { "type" => "control_plane", "value" => GithubAppInstallationToken.fetch(config) } if source_type == "github_app"
 
     source = config.is_a?(Hash) ? config.dup : {}
     source["type"] = source_type
@@ -64,6 +69,7 @@ class SecretSource < ApplicationRecord
   # proxy never receives an empty inline value (see Principal#sync_secrets).
   def deliverable?
     return brokered_credential&.access_token.present? if source_type == "token_broker"
+    return GithubAppInstallationToken.fetch(config).present? if source_type == "github_app"
     true
   end
 
