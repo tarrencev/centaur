@@ -1,6 +1,9 @@
 pub mod amp;
 pub mod anthropic;
+pub mod bridge;
+pub mod bridge_host;
 pub mod claude;
+pub mod client_tools;
 pub mod codex;
 mod error;
 mod otel;
@@ -11,6 +14,7 @@ mod util;
 mod validation;
 pub mod wire;
 
+pub use bridge::run as run_client_tools_bridge;
 pub use error::{HarnessServerError, Result};
 pub use server::{run_blocks_server, run_harness_server, run_validate_jsonrpc, server_for};
 pub use traits::{

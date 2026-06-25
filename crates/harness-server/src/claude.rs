@@ -250,6 +250,13 @@ impl HarnessServer for ClaudeCodeHarness {
                 .arg("--append-system-prompt-file")
                 .arg(extra_system_prompt_file);
         }
+        // Client-side (forward-only) tools: register the bridge as an MCP server
+        // so the model can call the user's local tools. Only active once the
+        // server-side bridge listener is live (CENTAUR_CLIENT_TOOLS_SOCKET set).
+        if let Some(file) = write_client_tools_mcp_config(state) {
+            command.arg("--mcp-config").arg(file);
+            command.args(["--allowedTools", &crate::client_tools::claude_allowed_tools()]);
+        }
         if let Some(session_id) = &state.harness_session_id {
             command.args(["--resume", session_id]);
         } else {
@@ -281,6 +288,22 @@ impl HarnessServer for ClaudeCodeHarness {
         event: Self::Event,
     ) -> Result<Vec<NormalizedEvent>> {
         Ok(normalizer.normalize(event))
+    }
+}
+
+/// Write the Claude `--mcp-config` for the client-tools bridge into the workspace
+/// and return its path, or `None` when client-tool passthrough is inactive.
+fn write_client_tools_mcp_config(state: &ThreadState) -> Option<PathBuf> {
+    let (_, socket) = crate::client_tools::active()?;
+    let (cmd, args) = crate::client_tools::bridge_command(&socket);
+    let config = crate::client_tools::claude_mcp_config(&cmd, &args);
+    let path = state.cwd.join(".centaur-client-tools-mcp.json");
+    match fs::write(&path, serde_json::to_vec(&config).ok()?) {
+        Ok(()) => Some(path),
+        Err(error) => {
+            eprintln!("failed to write client-tools MCP config: {error}");
+            None
+        }
     }
 }
 
