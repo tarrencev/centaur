@@ -250,6 +250,9 @@ pub struct ExecuteSessionInput {
     pub max_duration_ms: Option<u64>,
     pub model: Option<String>,
     pub system_prompt: Option<String>,
+    /// JSON array of client-advertised (local) tool definitions, passed verbatim
+    /// to the harness so it can offer them as forward-only client-side tools.
+    pub client_tools: Option<String>,
 }
 
 #[derive(Clone)]
@@ -300,6 +303,7 @@ struct PersonaResolution {
 struct SessionSandboxOverrides<'a> {
     model: Option<&'a str>,
     system_prompt: Option<&'a str>,
+    client_tools: Option<&'a str>,
 }
 
 impl SessionSandboxOverrides<'_> {
@@ -308,6 +312,9 @@ impl SessionSandboxOverrides<'_> {
             || self
                 .system_prompt
                 .is_some_and(|prompt| !prompt.trim().is_empty())
+            || self
+                .client_tools
+                .is_some_and(|tools| !tools.trim().is_empty())
     }
 }
 
@@ -886,6 +893,7 @@ impl SessionRuntime {
             max_duration_ms,
             model,
             system_prompt,
+            client_tools,
         } = input;
         let input_line_count = input_lines.len();
         let idempotency_key_present = idempotency_key.is_some();
@@ -1015,6 +1023,7 @@ impl SessionRuntime {
                     SessionSandboxOverrides {
                         model: model.as_deref(),
                         system_prompt: system_prompt.as_deref(),
+                        client_tools: client_tools.as_deref(),
                     },
                 )
                 .instrument(execution_trace_span.clone())
@@ -2228,6 +2237,12 @@ fn apply_session_sandbox_overrides(
     }
     if let Some(system_prompt) = overrides.system_prompt.and_then(non_empty_str) {
         upsert_env(spec, "CENTAUR_EXTRA_SYSTEM_PROMPT", system_prompt);
+    }
+    // Client-advertised (local) tools the harness may offer as forward-only
+    // tools: a call to one is emitted to the client instead of run in-sandbox,
+    // and the steered tool_result resumes the turn.
+    if let Some(client_tools) = overrides.client_tools.and_then(non_empty_str) {
+        upsert_env(spec, "CENTAUR_CLIENT_TOOLS", client_tools);
     }
 }
 

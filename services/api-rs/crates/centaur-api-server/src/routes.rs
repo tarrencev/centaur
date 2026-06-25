@@ -475,6 +475,7 @@ async fn execute_session(
                 max_duration_ms: request.max_duration_ms,
                 model: None,
                 system_prompt: None,
+                client_tools: None,
             },
         )
         .await?;

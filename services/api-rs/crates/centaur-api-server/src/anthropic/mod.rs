@@ -52,6 +52,9 @@ use translate::{AnthropicTranslator, error_event};
 /// Header Claude Code sends carrying its stable session id — the same id it uses
 /// for `--resume`/`--continue`. The Centaur thread is keyed on it.
 const CLAUDE_SESSION_HEADER: &str = "x-claude-code-session-id";
+/// Optional persona selector. When absent, the runtime falls back to
+/// `CENTAUR_DEFAULT_PERSONA` (or the harness default).
+const CENTAUR_PERSONA_HEADER: &str = "x-centaur-persona";
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct AnthropicMessagesRequest {
@@ -173,15 +176,20 @@ pub(crate) async fn anthropic_messages(
     Json(request): Json<AnthropicMessagesRequest>,
 ) -> Result<Response, AnthropicHttpError> {
     let thread_key = thread_key_from_headers(&headers)?;
+    let persona_id = persona_from_headers(&headers)?;
     let model = non_empty_string(&request.model);
     let system_prompt = flatten_system_prompt(request.system.as_ref());
-    let _decorative = (request.max_tokens, &request.tools);
+    // The client's advertised tools are forwarded to the harness as client-side
+    // (forward-only) tools; a call to one is emitted back to this CLI to run
+    // natively. Serialize the manifest verbatim.
+    let client_tools = client_tools_json(request.tools.as_ref());
+    let _decorative = request.max_tokens;
     let runtime = state.runtime()?;
     let _outcome = runtime
         .create_or_get_session(
             &thread_key,
             &HarnessType::ClaudeCode,
-            None,
+            persona_id.as_deref(),
             request.metadata.clone(),
             HarnessConflictPolicy::Reject,
         )
@@ -220,6 +228,7 @@ pub(crate) async fn anthropic_messages(
                 max_duration_ms: None,
                 model,
                 system_prompt,
+                client_tools,
             },
         )
         .await
@@ -288,6 +297,33 @@ pub(crate) async fn anthropic_messages(
 /// resumed CLI session (`claude --resume`/`--continue`) continues the same
 /// durable thread and reuses its warm sandbox. Falls back to a fresh
 /// `api:<uuid>` thread when the header is absent (e.g. a raw SDK client).
+/// Read the optional `x-centaur-persona` selector. Empty/absent means "no
+/// explicit persona" so the runtime applies its configured default.
+fn persona_from_headers(headers: &HeaderMap) -> Result<Option<String>, AnthropicHttpError> {
+    match headers.get(CENTAUR_PERSONA_HEADER) {
+        Some(value) => {
+            let persona = value
+                .to_str()
+                .map_err(|_| {
+                    AnthropicHttpError::bad_request("x-centaur-persona must be valid UTF-8")
+                })?
+                .trim();
+            Ok((!persona.is_empty()).then(|| persona.to_owned()))
+        }
+        None => Ok(None),
+    }
+}
+
+/// Serialize the client's advertised tool manifest for the harness. Returns
+/// `None` when absent, null, or an empty array (nothing to offer client-side).
+fn client_tools_json(tools: Option<&Value>) -> Option<String> {
+    match tools? {
+        Value::Null => None,
+        Value::Array(items) if items.is_empty() => None,
+        value => serde_json::to_string(value).ok(),
+    }
+}
+
 fn thread_key_from_headers(headers: &HeaderMap) -> Result<ThreadKey, AnthropicHttpError> {
     let raw = match headers.get(CLAUDE_SESSION_HEADER) {
         Some(value) => {
@@ -440,5 +476,35 @@ mod tests {
         let key = thread_key_from_headers(&HeaderMap::new()).unwrap();
         assert!(key.as_str().starts_with("api:"));
         assert!(!key.as_str().contains("claude"));
+    }
+
+    #[test]
+    fn reads_persona_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert(CENTAUR_PERSONA_HEADER, "c7e-orchestrator".parse().unwrap());
+        assert_eq!(
+            persona_from_headers(&headers).unwrap().as_deref(),
+            Some("c7e-orchestrator")
+        );
+    }
+
+    #[test]
+    fn persona_absent_or_blank_is_none() {
+        assert_eq!(persona_from_headers(&HeaderMap::new()).unwrap(), None);
+        let mut headers = HeaderMap::new();
+        headers.insert(CENTAUR_PERSONA_HEADER, "  ".parse().unwrap());
+        assert_eq!(persona_from_headers(&headers).unwrap(), None);
+    }
+
+    #[test]
+    fn client_tools_json_skips_empty_and_serializes() {
+        assert_eq!(client_tools_json(None), None);
+        assert_eq!(client_tools_json(Some(&json!(null))), None);
+        assert_eq!(client_tools_json(Some(&json!([]))), None);
+        let tools = json!([{"name": "Bash"}]);
+        assert_eq!(
+            client_tools_json(Some(&tools)).as_deref(),
+            Some(r#"[{"name":"Bash"}]"#)
+        );
     }
 }
