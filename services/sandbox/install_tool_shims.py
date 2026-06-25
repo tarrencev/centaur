@@ -355,8 +355,12 @@ def _discover_scripts(tool_dirs: list[Path]) -> dict[str, dict[str, str]]:
             project = data.get("project") or {}
             # Only shim allowlisted tools (by package dir or project name) so the
             # agent's catalog is exactly the configured tools. Unset -> shim all.
-            if allowlist is not None and allowlist.isdisjoint(
-                {pyproject.parent.name, str(project.get("name") or "")}
+            package_dir = pyproject.parent.name
+            project_name = str(project.get("name") or "")
+            if (
+                allowlist is not None
+                and package_dir not in allowlist
+                and project_name not in allowlist
             ):
                 continue
             project_scripts = project.get("scripts") or {}
