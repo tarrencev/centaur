@@ -1,0 +1,102 @@
+#!/usr/bin/env python3
+"""Link your local ChatGPT/Codex login to centaur so agents use YOUR subscription.
+
+Run `codex login` first, then run this with the pairing token the bot DM'd you:
+
+    codex-link cpt_xxxxxxxx... --console-url https://console.example.com
+
+It reads your refresh token + account id from ~/.codex/auth.json and uploads
+them to centaur-console, which keeps the access token refreshed server-side. Your
+machine does NOT need to stay online afterwards. The refresh token never leaves
+your machine except to centaur over HTTPS; nothing is printed.
+
+Stdlib only — no install step.
+"""
+import argparse
+import json
+import os
+import sys
+import urllib.error
+import urllib.request
+
+DEFAULT_AUTH_JSON = os.path.expanduser("~/.codex/auth.json")
+
+
+def read_codex_tokens(path):
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except FileNotFoundError:
+        sys.exit(f"error: {path} not found — run `codex login` first.")
+    except (OSError, ValueError) as exc:
+        sys.exit(f"error: could not read {path}: {exc}")
+
+    tokens = data.get("tokens") or {}
+    refresh_token = tokens.get("refresh_token")
+    account_id = tokens.get("account_id")
+    if data.get("auth_mode") and data["auth_mode"] != "chatgpt":
+        sys.exit("error: this auth.json is API-key mode, not a ChatGPT login. Run `codex login`.")
+    if not refresh_token:
+        sys.exit("error: no refresh_token in auth.json — sign in with `codex login` (not --with-api-key).")
+    if not account_id:
+        sys.exit("error: no account_id in auth.json — re-run `codex login`.")
+    return refresh_token, account_id
+
+
+def upload(console_url, pairing_token, refresh_token, account_id):
+    url = console_url.rstrip("/") + "/api/v1/codex/credentials"
+    body = json.dumps({"data": {"refresh_token": refresh_token, "account_id": account_id}}).encode()
+    req = urllib.request.Request(
+        url,
+        data=body,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {pairing_token}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return resp.status, json.loads(resp.read() or b"{}")
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode(errors="replace")
+        try:
+            detail = json.loads(detail).get("error", {}).get("message", detail)
+        except ValueError:
+            pass
+        return exc.code, {"error": {"message": detail}}
+    except urllib.error.URLError as exc:
+        sys.exit(f"error: could not reach {console_url}: {exc.reason}")
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="Link your Codex login to centaur.")
+    parser.add_argument("pairing_token", help="the cpt_... token the bot DM'd you")
+    parser.add_argument(
+        "--console-url",
+        default=os.environ.get("CENTAUR_CONSOLE_URL"),
+        help="centaur-console base URL (or set CENTAUR_CONSOLE_URL)",
+    )
+    parser.add_argument(
+        "--auth-json", default=DEFAULT_AUTH_JSON, help=f"path to auth.json (default {DEFAULT_AUTH_JSON})"
+    )
+    args = parser.parse_args(argv)
+
+    if not args.console_url:
+        parser.error("--console-url is required (or set CENTAUR_CONSOLE_URL)")
+
+    refresh_token, account_id = read_codex_tokens(args.auth_json)
+    status, payload = upload(args.console_url, args.pairing_token, refresh_token, account_id)
+
+    if status in (200, 201):
+        print("✓ Codex linked. Agents in your DM now use your ChatGPT subscription.")
+        return 0
+
+    message = (payload.get("error") or {}).get("message") or payload
+    print(f"✗ Linking failed (HTTP {status}): {message}", file=sys.stderr)
+    return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

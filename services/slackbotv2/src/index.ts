@@ -33,6 +33,7 @@ import {
   sessionStreamError
 } from './session-api'
 import { extractMessageOverrides } from './overrides'
+import { handleConnectCodexCommand, isConnectCodexCommand } from './connect-codex'
 import { isAllowedSlackMessage, isAllowedSlackWebhookBody } from './slack-events'
 import type {
   ForwardSessionInput,
@@ -134,6 +135,10 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
 
   chat.onNewMention(async (thread, message) => {
     if (!isAllowedSlackMessage(message, options, logger)) return
+    if (isConnectCodexCommand(message.text)) {
+      await handleConnectCodexCommand(thread, message, options)
+      return
+    }
     await handleSlackMessageHandoff(thread, message, {
       assistantStatusRequested: true,
       mode: 'execute',
@@ -146,6 +151,10 @@ export function createSlackbotV2(options: SlackbotV2Options): SlackbotV2 {
 
   chat.onSubscribedMessage(async (thread, message) => {
     if (!isAllowedSlackMessage(message, options, logger)) return
+    if (isConnectCodexCommand(message.text)) {
+      await handleConnectCodexCommand(thread, message, options)
+      return
+    }
     await handleSlackMessageHandoff(thread, message, {
       assistantStatusRequested: message.isMention === true,
       mode: message.isMention === true ? 'execute' : 'append',

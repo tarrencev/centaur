@@ -85,6 +85,16 @@ export type SlackbotV2Options = {
   assistantStatus?: string
   botToken: string
   botUserId?: string
+  /** centaur-console base URL, for the /connect-codex command. */
+  consoleUrl?: string
+  /** Operator API key (Bearer) used to mint Codex pairing tokens on the console. */
+  consoleApiKey?: string
+  /**
+   * Publicly reachable console URL shown in the /connect-codex instructions, for
+   * the user's local `codex-link` helper. Defaults to consoleUrl, but that is
+   * usually the in-cluster URL, so set this to the internet-facing one.
+   */
+  consolePublicUrl?: string
   /**
    * Harness for new threads when no --claude/--amp/--codex flag is given
    * (HarnessType wire value: codex | amp | claudecode). Defaults to codex.

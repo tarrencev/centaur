@@ -10,7 +10,7 @@
 #
 # It's strongly recommended that you check this file into your version control system.
 
-ActiveRecord::Schema[8.1].define(version: 2026_06_16_170000) do
+ActiveRecord::Schema[8.1].define(version: 2026_06_26_120000) do
   # These are extensions that must be enabled in order to support this database
   enable_extension "pg_catalog.plpgsql"
 
@@ -78,6 +78,19 @@ ActiveRecord::Schema[8.1].define(version: 2026_06_16_170000) do
     t.index ["next_attempt_at"], name: "index_broker_credentials_on_next_attempt_at"
     t.index ["oauth_app_id", "provider_subject"], name: "index_broker_credentials_on_oauth_app_id_and_provider_subject", unique: true, where: "(provider_subject IS NOT NULL)"
     t.index ["oauth_app_id"], name: "index_broker_credentials_on_oauth_app_id"
+  end
+
+  create_table "codex_pairing_tokens", force: :cascade do |t|
+    t.datetime "created_at", null: false
+    t.bigint "created_by_id", null: false
+    t.datetime "expires_at", null: false
+    t.jsonb "principal_selector", default: {}, null: false
+    t.string "token_hash", null: false
+    t.datetime "updated_at", null: false
+    t.datetime "used_at"
+    t.index ["created_by_id"], name: "index_codex_pairing_tokens_on_created_by_id"
+    t.index ["expires_at"], name: "index_codex_pairing_tokens_on_expires_at"
+    t.index ["token_hash"], name: "index_codex_pairing_tokens_on_token_hash", unique: true
   end
 
   create_table "gcp_auth_secrets", force: :cascade do |t|

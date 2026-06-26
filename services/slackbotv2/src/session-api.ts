@@ -754,7 +754,7 @@ async function resolveConversationName(
 // and falling back to the conversation segment of the thread key
 // (`<source>:[<team>:]<conversation>[:<ts>]`). Slack ids carry their type in the
 // first letter: C/G are channels/groups, D is a direct message.
-function slackConversationId(message: SlackbotV2ApiMessage): string | undefined {
+export function slackConversationId(message: SlackbotV2ApiMessage): string | undefined {
   const fromRaw = rawSlackString(message.raw, 'channel')
   if (fromRaw) return fromRaw
   for (const segment of message.threadId.split(':').slice(1)) {
@@ -764,7 +764,7 @@ function slackConversationId(message: SlackbotV2ApiMessage): string | undefined 
   return undefined
 }
 
-function slackConversationKind(
+export function slackConversationKind(
   conversationId: string | undefined
 ): 'channel' | 'dm' | undefined {
   const first = conversationId?.charAt(0)
