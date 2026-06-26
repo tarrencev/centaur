@@ -13,6 +13,7 @@ class ConsoleController < ApplicationController
     "env" => "Env", "aws_sm" => "AWS-SM", "aws_ssm" => "AWS-SSM",
     "1password" => "1Password", "1password_connect" => "1Password-Connect",
     "control_plane" => "Inline", "token_broker" => "Token-Broker",
+    "github_app" => "GitHub App",
     "workload_identity" => "Workload-Identity"
   }.freeze
 

@@ -24,7 +24,7 @@ module SecretKinds
   SOURCE_REF_KEYS = {
     "env" => "var", "aws_sm" => "secret_id", "aws_ssm" => "name",
     "1password" => "secret_ref", "1password_connect" => "secret_ref",
-    "token_broker" => "credential_id"
+    "token_broker" => "credential_id", "github_app" => "installation_id_env"
   }.freeze
 
   included do

@@ -150,6 +150,40 @@ class ProxySyncControllerTest < ActionDispatch::IntegrationTest
     assert_equal first, second
   end
 
+  test "github_app sources refresh after the base sync snapshot ttl" do
+    @inject.source.destroy!
+    SecretSource.create!(
+      source_type: "github_app",
+      config: {
+        "app_id_env" => "GITHUB_APP_ID",
+        "installation_id_env" => "GITHUB_APP_INSTALLATION_ID",
+        "private_key_b64_env" => "GITHUB_APP_PRIVATE_KEY_B64"
+      },
+      static_secret: @inject
+    )
+
+    GithubAppInstallationToken.stub(:fetch, "ghs_first") do
+      post api_v1_proxy_sync_url, params: {}.to_json, headers: auth_headers
+    end
+    assert_response :ok
+    first_hash = json_body.fetch("config_hash")
+    assert json_body.fetch("secrets").any? { |secret|
+      secret.dig("source", "value") == "ghs_first"
+    }
+
+    snapshot = PrincipalSyncConfigSnapshot.find_by!(principal: @proxy.principal)
+    snapshot.update!(updated_at: PrincipalSyncConfigSnapshot::TTL.ago - 1.second)
+
+    GithubAppInstallationToken.stub(:fetch, "ghs_second") do
+      post api_v1_proxy_sync_url, params: { config_hash: first_hash }.to_json, headers: auth_headers
+    end
+    assert_response :ok
+    refute_equal first_hash, json_body.fetch("config_hash")
+    assert json_body.fetch("secrets").any? { |secret|
+      secret.dig("source", "value") == "ghs_second"
+    }
+  end
+
   test "transforms carries gcp auth transforms per grant and a single bundled oauth_token" do
     admin = users(:acme_admin)
     Grant.create!(principal: @proxy.principal, gcp_auth_secret: gcp_auth_secrets(:acme_bigquery), created_by: admin)

@@ -30,6 +30,16 @@ class SecretSourceTest < ActiveSupport::TestCase
     assert s.valid?
   end
 
+  test "github_app source is valid with env references" do
+    s = new_source(source_type: "github_app",
+                   config: {
+                     "app_id_env" => "GITHUB_APP_ID",
+                     "installation_id_env" => "GITHUB_APP_INSTALLATION_ID",
+                     "private_key_b64_env" => "GITHUB_APP_PRIVATE_KEY_B64"
+                   })
+    assert s.valid?, s.errors.full_messages.inspect
+  end
+
   test "universal json_key is allowed for all source types" do
     SecretSource::SOURCE_TYPES.each do |type|
       required = SecretSource::CONFIG_SCHEMA[type][:required]
@@ -201,6 +211,19 @@ class SecretSourceTest < ActiveSupport::TestCase
   test "token_broker source is not deliverable when the credential is missing" do
     s = new_source(source_type: "token_broker", config: { "credential_id" => "bcr_missing" })
     assert_not s.deliverable?
+  end
+
+  test "github_app source resolves to a control_plane inline value at sync" do
+    GithubAppInstallationToken.stub(:fetch, "ghs_live") do
+      s = new_source(source_type: "github_app",
+                     config: {
+                       "app_id_env" => "GITHUB_APP_ID",
+                       "installation_id_env" => "GITHUB_APP_INSTALLATION_ID",
+                       "private_key_b64_env" => "GITHUB_APP_PRIVATE_KEY_B64"
+                     })
+      assert_equal({ "type" => "control_plane", "value" => "ghs_live" }, s.to_proxy_source)
+      assert s.deliverable?
+    end
   end
 
   # A persisted BrokerCredential. access_token is set via the model so encryption
