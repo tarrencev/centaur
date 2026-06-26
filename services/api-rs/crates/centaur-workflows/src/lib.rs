@@ -3486,7 +3486,6 @@ async fn run_agent_session_turn(
                 max_duration_ms: Some(max_duration_ms),
                 model: None,
                 system_prompt: None,
-                client_tools: None,
             },
         )
         .await?;

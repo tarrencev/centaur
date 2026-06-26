@@ -52,9 +52,6 @@ use translate::{ResponsesTranslator, usage_object};
 /// `prompt_cache_key` and `client_metadata.session_id`, stable across
 /// `codex resume`). The Centaur thread is keyed on it.
 const CODEX_SESSION_HEADER: &str = "session-id";
-/// Optional persona selector. When absent, the runtime falls back to
-/// `CENTAUR_DEFAULT_PERSONA` (or the harness default).
-const CENTAUR_PERSONA_HEADER: &str = "x-centaur-persona";
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct OpenAIResponsesRequest {
@@ -154,23 +151,18 @@ pub(crate) async fn create_response(
     Json(request): Json<OpenAIResponsesRequest>,
 ) -> Result<Response, ResponsesHttpError> {
     let thread_key = thread_key_from_request(&headers, &request)?;
-    let persona_id = persona_from_headers(&headers)?;
     // Centaur owns the harness, model and persona. The client's `model` and
     // `instructions` are echoed back but NOT threaded into the harness: the
     // default ClaudeCode harness cannot run the gpt-* models a Codex client
     // requests, and the client instructions are the Codex CLI persona, not
     // Centaur's. Honoring them via a Codex harness mapping is a follow-up.
-    // The persona, however, IS honored via the `x-centaur-persona` header.
-    // The client's advertised tools are forwarded to the harness as client-side
-    // (forward-only) tools.
-    let client_tools = client_tools_json(request.tools.as_ref());
-    let _decorative = (&request.model, &request.instructions);
+    let _decorative = (&request.model, &request.instructions, &request.tools);
     let runtime = state.runtime()?;
     let _outcome = runtime
         .create_or_get_session(
             &thread_key,
             &HarnessType::Codex,
-            persona_id.as_deref(),
+            None,
             request.metadata.clone(),
             HarnessConflictPolicy::Reject,
         )
@@ -208,7 +200,6 @@ pub(crate) async fn create_response(
                 max_duration_ms: None,
                 model: None,
                 system_prompt: None,
-                client_tools,
             },
         )
         .await
@@ -277,33 +268,6 @@ pub(crate) async fn create_response(
 /// warm sandbox. Reads the `session-id` header, falling back to the body's
 /// `prompt_cache_key`; both are the same id and stable across resume. Falls back
 /// to a fresh `api:<uuid>` thread when neither is present.
-/// Read the optional `x-centaur-persona` selector. Empty/absent means "no
-/// explicit persona" so the runtime applies its configured default.
-fn persona_from_headers(headers: &HeaderMap) -> Result<Option<String>, ResponsesHttpError> {
-    match headers.get(CENTAUR_PERSONA_HEADER) {
-        Some(value) => {
-            let persona = value
-                .to_str()
-                .map_err(|_| {
-                    ResponsesHttpError::bad_request("x-centaur-persona must be valid UTF-8")
-                })?
-                .trim();
-            Ok((!persona.is_empty()).then(|| persona.to_owned()))
-        }
-        None => Ok(None),
-    }
-}
-
-/// Serialize the client's advertised tool manifest for the harness. Returns
-/// `None` when absent, null, or an empty array (nothing to offer client-side).
-fn client_tools_json(tools: Option<&Value>) -> Option<String> {
-    match tools? {
-        Value::Null => None,
-        Value::Array(items) if items.is_empty() => None,
-        value => serde_json::to_string(value).ok(),
-    }
-}
-
 fn thread_key_from_request(
     headers: &HeaderMap,
     request: &OpenAIResponsesRequest,
