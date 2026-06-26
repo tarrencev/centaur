@@ -256,3 +256,5 @@ jobs:
             "client_payload": { "sha": "${GITHUB_SHA}", "tag": "sha-${short}", "ref": "${GITHUB_REF_NAME}" }
           }
           EOF
+
+# (re-trigger publish for sha with 0a344cbf re-added)
