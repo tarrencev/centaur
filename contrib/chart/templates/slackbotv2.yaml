@@ -60,11 +60,12 @@ spec:
                 secretKeyRef:
                   name: {{ include "centaur.secretEnvName" . }}
                   key: {{ printf "%sSLACKBOT_API_KEY" .Values.secretManager.envPrefix }}
-{{- if .Values.console.enabled }}
+{{- if (include "centaur.consoleValues" . | fromYaml).enabled }}
             # Lets the /connect-codex command mint per-user Codex pairing tokens
-            # on the console (operator ApiKey auth).
+            # on the console (operator ApiKey auth). Uses the console helper so it
+            # honors the deprecated `ironControl` alias too.
             - name: CENTAUR_CONSOLE_URL
-              value: {{ printf "http://%s:%v" (include "centaur.consoleName" .) .Values.console.service.httpPort | quote }}
+              value: {{ include "centaur.consoleUrl" . | quote }}
             - name: CONSOLE_API_KEY
               valueFrom:
                 secretKeyRef:
