@@ -60,6 +60,23 @@ spec:
                 secretKeyRef:
                   name: {{ include "centaur.secretEnvName" . }}
                   key: {{ printf "%sSLACKBOT_API_KEY" .Values.secretManager.envPrefix }}
+{{- if (include "centaur.consoleValues" . | fromYaml).enabled }}
+            # Lets the /connect-codex command mint per-user Codex pairing tokens
+            # on the console (operator ApiKey auth). Uses the console helper so it
+            # honors the deprecated `ironControl` alias too.
+            - name: CENTAUR_CONSOLE_URL
+              value: {{ include "centaur.consoleUrl" . | quote }}
+            - name: CONSOLE_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "centaur.secretEnvName" . }}
+                  key: {{ printf "%sCONSOLE_API_KEY" .Values.secretManager.envPrefix }}
+{{- if .Values.slackbotv2.consolePublicUrl }}
+            # Internet-facing console URL shown to users for the local codex-link helper.
+            - name: CENTAUR_CONSOLE_PUBLIC_URL
+              value: {{ .Values.slackbotv2.consolePublicUrl | quote }}
+{{- end }}
+{{- end }}
             - name: SLACKBOTV2_DATABASE_URL
               valueFrom:
                 secretKeyRef:

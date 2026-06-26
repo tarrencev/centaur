@@ -231,6 +231,12 @@ spec:
         - podSelector:
             matchLabels:
               centaur.ai/iron-proxy: "true"
+{{- if .Values.slackbotv2.enabled }}
+        # slackbotv2 mints per-user Codex pairing tokens for /connect-codex.
+        - podSelector:
+            matchLabels:
+{{ include "centaur.componentSelectorLabels" (dict "root" . "component" "slackbotv2") | nindent 14 }}
+{{- end }}
 {{- if $console.ingress.enabled }}
         # Ingress controller pods (Tailscale operator, Cloudflare, ...)
         # forwarding external traffic to console.

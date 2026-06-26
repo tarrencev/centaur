@@ -141,6 +141,13 @@ Rails.application.routes.draw do
         collection { get "lookup/:slug", action: :lookup, as: :lookup }
       end
 
+      # Per-user Codex linking. pairing_tokens is minted by the bot (ApiKey auth);
+      # credentials is redeemed by the user's local helper (pairing-token auth).
+      namespace :codex do
+        resources :pairing_tokens, only: %i[create]
+        resources :credentials, only: %i[create]
+      end
+
       # Called by iron-proxy instances (proxy bearer auth, not ApiKey auth).
       post "proxy/sync", to: "proxy_sync#create"
     end

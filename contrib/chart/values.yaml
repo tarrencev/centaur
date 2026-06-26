@@ -337,6 +337,10 @@ slackbotv2:
   assistantStatus: ""
   externalOrgAllowlist: ""
   triggerBotAllowlist: ""
+  # Internet-facing console URL shown in /connect-codex instructions (the user's
+  # local codex-link helper must reach it). Defaults to the in-cluster URL, which
+  # is usually not reachable from a laptop — set this to the public URL.
+  consolePublicUrl: ""
   metrics:
     # slackbotv2 serves Prometheus text metrics at /metrics. This flag only
     # controls scrape annotations for Prometheus/VictoriaMetrics-style discovery.
