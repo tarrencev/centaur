@@ -197,6 +197,13 @@ pub fn build_router_with_app_state(state: AppState) -> Router {
             "/v1/responses",
             post(openai::create_response).layer(DefaultBodyLimit::disable()),
         )
+        // Transparent reverse-proxy for the sandbox agent's model calls (step 1
+        // of local<->sandbox tool unification). Lets Centaur sit on the
+        // sandbox->model path so it can later inject/route client tools.
+        .route(
+            "/sandbox/model/{*rest}",
+            any(proxy_sandbox_model).layer(DefaultBodyLimit::disable()),
+        )
         .route(
             "/api/session/{thread_key}",
             post(create_or_get_session).get(get_session_context),
@@ -313,6 +320,87 @@ pub fn build_router_with_app_state(state: AppState) -> Router {
 
 async fn healthz() -> Json<Value> {
     Json(json!({"ok": true}))
+}
+
+/// Shared client for the sandbox model-proxy.
+static MODEL_PROXY_CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+
+/// Transparent reverse-proxy for the sandbox agent's model calls:
+/// `/sandbox/model/<rest>` -> `CENTAUR_SANDBOX_MODEL_UPSTREAM`/<rest> (default
+/// hydra's `backend-api/codex`). Replaces the incoming Authorization with the
+/// real `HYDRA_API_KEY` (the sandbox only carries a placeholder), forwards
+/// method/body/headers, and streams the (SSE) response straight back.
+///
+/// Step 1 of local<->sandbox tool unification: get Centaur onto the
+/// sandbox->model path with zero behavior change, so it can later inject and
+/// route client tools.
+async fn proxy_sandbox_model(req: Request) -> Response {
+    let (parts, body) = req.into_parts();
+    let path_and_query = parts
+        .uri
+        .path_and_query()
+        .map(|pq| pq.as_str())
+        .unwrap_or("/");
+    let rest = path_and_query
+        .strip_prefix("/sandbox/model")
+        .unwrap_or(path_and_query);
+    let upstream = env::var("CENTAUR_SANDBOX_MODEL_UPSTREAM")
+        .unwrap_or_else(|_| "https://hydra.64.34.84.225.sslip.io/backend-api/codex".to_string());
+    let url = format!("{}{}", upstream.trim_end_matches('/'), rest);
+
+    let body_bytes = match axum::body::to_bytes(body, usize::MAX).await {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            return (StatusCode::BAD_REQUEST, format!("model proxy: bad body: {err}"))
+                .into_response();
+        }
+    };
+
+    let client = MODEL_PROXY_CLIENT.get_or_init(reqwest::Client::new);
+    let mut outbound = client
+        .request(parts.method.clone(), &url)
+        .body(body_bytes.to_vec());
+    for (name, value) in parts.headers.iter() {
+        match name.as_str() {
+            "host" | "authorization" | "content-length" => continue,
+            _ => outbound = outbound.header(name.clone(), value.clone()),
+        }
+    }
+    if let Ok(key) = env::var("HYDRA_API_KEY") {
+        let key = key.trim();
+        if !key.is_empty() {
+            outbound = outbound.header("authorization", format!("Bearer {key}"));
+        }
+    }
+
+    let upstream_resp = match outbound.send().await {
+        Ok(resp) => resp,
+        Err(err) => {
+            tracing::error!(error = %err, url = %url, "sandbox model proxy upstream error");
+            return (StatusCode::BAD_GATEWAY, format!("model proxy upstream error: {err}"))
+                .into_response();
+        }
+    };
+
+    let status = upstream_resp.status();
+    let mut builder = Response::builder().status(status.as_u16());
+    for (name, value) in upstream_resp.headers().iter() {
+        match name.as_str() {
+            "content-length" | "transfer-encoding" | "connection" => continue,
+            _ => builder = builder.header(name.clone(), value.clone()),
+        }
+    }
+    match builder.body(Body::from_stream(upstream_resp.bytes_stream())) {
+        Ok(resp) => resp,
+        Err(err) => {
+            tracing::error!(error = %err, "sandbox model proxy response build failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "model proxy response build failed",
+            )
+                .into_response()
+        }
+    }
 }
 
 async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
