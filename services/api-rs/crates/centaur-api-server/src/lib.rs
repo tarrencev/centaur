@@ -1,6 +1,7 @@
 mod anthropic;
 pub mod client;
 mod error;
+mod model_proxy;
 mod openai;
 mod routes;
 pub mod types;
