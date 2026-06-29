@@ -617,7 +617,7 @@ async fn proxy_with_local_bridge(
                 PendingLocalCall {
                     call_id: call.call_id.clone(),
                     name: real_name,
-                    arguments: call.arguments.clone(),
+                    arguments: strip_local_call_location(&call.arguments),
                 },
             );
             let output = match tokio::time::timeout(LOCAL_CALL_TIMEOUT, rx).await {
@@ -674,6 +674,25 @@ pub fn is_local(name: &str) -> bool {
 /// tool name. Names without the prefix are returned unchanged.
 pub fn strip_local_prefix(name: &str) -> &str {
     name.strip_prefix(LOCAL_TOOL_PREFIX).unwrap_or(name)
+}
+
+/// Strip sandbox-specific location args (`workdir`, `cwd`) from a forwarded local
+/// tool call's arguments. The sandbox agent fills these with sandbox paths (e.g.
+/// `/home/agent/workspace`) that don't exist on the user's machine, which breaks
+/// local exec; dropping them lets the local CLI use its own working directory.
+/// Returns the input unchanged if it isn't a JSON object or has no such keys.
+pub fn strip_local_call_location(arguments: &str) -> String {
+    match serde_json::from_str::<Value>(arguments) {
+        Ok(Value::Object(mut map)) => {
+            let removed = map.remove("workdir").is_some() | map.remove("cwd").is_some();
+            if removed {
+                serde_json::to_string(&Value::Object(map)).unwrap_or_else(|_| arguments.to_owned())
+            } else {
+                arguments.to_owned()
+            }
+        }
+        _ => arguments.to_owned(),
+    }
 }
 
 /// Inject the client's advertised tools into the Responses request's `tools`
@@ -748,7 +767,7 @@ const ENV_GUIDANCE_MARKER: &str = "# Tool environments";
 /// Environment-selection guidance appended to the request `instructions` so the
 /// model knows what `sandbox__*` vs `local__*` mean and how to pick. Phase 1:
 /// one environment per turn (cover "both" by sequencing across turns).
-const ENV_GUIDANCE: &str = "\n\n# Tool environments\nTools are namespaced by where they run:\n- `sandbox__*` — an ephemeral cloud sandbox (its own files, the deployment's credentials and kubeconfig, cluster network).\n- `local__*` — the user's local machine (their working files, local credentials, and network).\nChoose the environment that matches the task: cluster/deploy/CI or sandbox files → `sandbox__*`; the user's local files, processes, or machine → `local__*`. If the user names an environment, use only that one. For read-only or diagnostic requests that aren't specific to one side (machine specs, OS, tool versions, env vars), gather from BOTH and report each side.\nDo NOT call `sandbox__*` and `local__*` tools in the same step — gather one environment, then gather the other in a following step. You may take as many steps as you need: keep going until you have everything the request needs from EVERY relevant environment, then give your final answer. Never stop and defer remaining environments to a future user message — complete them yourself in this same response.";
+const ENV_GUIDANCE: &str = "\n\n# Tool environments\nTools are namespaced by where they run:\n- `sandbox__*` — an ephemeral cloud sandbox (its own files, the deployment's credentials and kubeconfig, cluster network).\n- `local__*` — the user's local machine (their working files, local credentials, and network).\nThe local machine is a SEPARATE computer — often a different OS (e.g. macOS) with its own filesystem, working directory, and installed tools. For `local__*` calls do NOT reuse sandbox paths or a workdir/cwd from this sandbox, and don't assume Linux-only commands exist — prefer portable commands (use macOS forms like sysctl / sw_vers / vm_stat when probing a Mac).\nChoose the environment that matches the task: cluster/deploy/CI or sandbox files → `sandbox__*`; the user's local files, processes, or machine → `local__*`. If the user names an environment, use only that one. For read-only or diagnostic requests that aren't specific to one side (machine specs, OS, tool versions, env vars), gather from BOTH and report each side.\nDo NOT call `sandbox__*` and `local__*` tools in the same step — gather one environment, then gather the other in a following step. You may take as many steps as you need: keep going until you have everything the request needs from EVERY relevant environment, then give your final answer. Never stop and defer remaining environments to a future user message — complete them yourself in this same response.";
 
 /// Append the environment-selection guidance to the Responses request
 /// `instructions` (creating it if absent). Idempotent via [`ENV_GUIDANCE_MARKER`].
@@ -1175,6 +1194,23 @@ mod tests {
         assert_eq!(fco["type"], "function_call_output");
         assert_eq!(fco["call_id"], "call_abc");
         assert_eq!(fco["output"], r#"{"echo":"hi"}"#);
+    }
+
+    #[test]
+    fn strip_local_call_location_removes_sandbox_paths() {
+        // workdir + cwd removed, other args preserved.
+        let out = strip_local_call_location(r#"{"command":["hostname"],"workdir":"/home/agent/workspace","cwd":"/sbx"}"#);
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert!(v.get("workdir").is_none());
+        assert!(v.get("cwd").is_none());
+        assert_eq!(v["command"], json!(["hostname"]));
+        // No location keys → unchanged.
+        assert_eq!(
+            strip_local_call_location(r#"{"command":["ls"]}"#),
+            r#"{"command":["ls"]}"#
+        );
+        // Non-JSON → unchanged (never panics).
+        assert_eq!(strip_local_call_location("not json"), "not json");
     }
 
     #[test]
