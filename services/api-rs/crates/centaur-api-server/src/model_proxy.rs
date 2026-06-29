@@ -175,6 +175,70 @@ fn build_outbound(
     outbound
 }
 
+/// Loop-free passthrough for codex model calls that reach api-rs because a
+/// CoreDNS rewrite points the hydra host (`hydra.64.34.84.225.sslip.io`) at the
+/// centaur svc. Such requests arrive on the hydra path (`/backend-api/...`).
+/// Forward them to the REAL in-cluster hydra Service (`CENTAUR_HYDRA_REAL_UPSTREAM`,
+/// a name NOT affected by the CoreDNS rewrite, so no loop), re-injecting
+/// `HYDRA_API_KEY`. Gated by `CENTAUR_HYDRA_PATH_PROXY` — off => 404, so the
+/// route is inert until the CoreDNS rewrite is flipped to activate it.
+///
+/// Building block for the egress-interception pivot (see
+/// docs/local-sandbox-unification.md): because codex IGNORES config.toml's
+/// base_url, the only way to route its model calls through Centaur is at the
+/// network layer (CoreDNS). This handler is the Centaur-side landing for that.
+/// It is transparent for now; session identification + local-tool bridge
+/// routing on the hydra path are the remaining work.
+pub(crate) async fn proxy_hydra_ingress(req: Request) -> Response {
+    let enabled = env::var("CENTAUR_HYDRA_PATH_PROXY")
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false);
+    if !enabled {
+        return (StatusCode::NOT_FOUND, "hydra path proxy disabled").into_response();
+    }
+    let (parts, body) = req.into_parts();
+    let path_and_query = parts
+        .uri
+        .path_and_query()
+        .map(|pq| pq.as_str())
+        .unwrap_or("/");
+    let upstream = env::var("CENTAUR_HYDRA_REAL_UPSTREAM")
+        .unwrap_or_else(|_| "http://hydra.centaur".to_string());
+    let url = format!("{}{}", upstream.trim_end_matches('/'), path_and_query);
+
+    let body_bytes = match axum::body::to_bytes(body, usize::MAX).await {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            return (StatusCode::BAD_REQUEST, format!("hydra proxy: bad body: {err}"))
+                .into_response();
+        }
+    };
+    let outbound = build_outbound(&parts.method, &url, &parts.headers, body_bytes.to_vec());
+    let upstream_resp = match outbound.send().await {
+        Ok(resp) => resp,
+        Err(err) => {
+            tracing::error!(error = %err, url = %url, "hydra path proxy upstream error");
+            return (StatusCode::BAD_GATEWAY, format!("hydra upstream error: {err}"))
+                .into_response();
+        }
+    };
+    let status = upstream_resp.status();
+    let mut builder = Response::builder().status(status.as_u16());
+    for (name, value) in upstream_resp.headers().iter() {
+        match name.as_str() {
+            "content-length" | "transfer-encoding" | "connection" => continue,
+            _ => builder = builder.header(name.clone(), value.clone()),
+        }
+    }
+    match builder.body(Body::from_stream(upstream_resp.bytes_stream())) {
+        Ok(resp) => resp,
+        Err(err) => {
+            tracing::error!(error = %err, "hydra path proxy response build failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "hydra proxy build failed").into_response()
+        }
+    }
+}
+
 /// Step-1 behavior: stream the upstream (SSE) response straight back to the
 /// caller, unchanged.
 async fn transparent_passthrough(

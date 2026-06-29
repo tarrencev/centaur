@@ -204,6 +204,14 @@ pub fn build_router_with_app_state(state: AppState) -> Router {
             "/sandbox/model/{*rest}",
             any(proxy_sandbox_model).layer(DefaultBodyLimit::disable()),
         )
+        // Egress-pivot landing: codex ignores config.toml base_url, so its model
+        // calls can only be routed to Centaur at the network layer (CoreDNS
+        // rewrite of the hydra host -> this svc). Such calls arrive on the hydra
+        // `/backend-api/...` path. Inert (404) until CENTAUR_HYDRA_PATH_PROXY is set.
+        .route(
+            "/backend-api/{*rest}",
+            any(crate::model_proxy::proxy_hydra_ingress).layer(DefaultBodyLimit::disable()),
+        )
         .route(
             "/api/session/{thread_key}",
             post(create_or_get_session).get(get_session_context),
