@@ -214,13 +214,19 @@ async fn resolve_thread_key_from_body(
     let cache_key = extract_prompt_cache_key(body)?;
     for attempt in 0..THREAD_KEY_LOOKUP_RETRIES {
         if let Some(thread_key) = runtime.thread_key_for_harness_thread_id(&cache_key) {
+            tracing::info!(
+                prompt_cache_key = %cache_key,
+                thread_key = %thread_key,
+                attempt,
+                "sandbox model proxy: resolved session from prompt_cache_key"
+            );
             return Some(thread_key);
         }
         if attempt + 1 < THREAD_KEY_LOOKUP_RETRIES {
             tokio::time::sleep(THREAD_KEY_LOOKUP_INTERVAL).await;
         }
     }
-    tracing::debug!(
+    tracing::info!(
         prompt_cache_key = %cache_key,
         "sandbox model proxy: no session indexed for prompt_cache_key; passing through"
     );
