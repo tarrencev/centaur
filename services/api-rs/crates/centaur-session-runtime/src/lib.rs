@@ -1,4 +1,5 @@
 mod cleanup;
+mod local_tool_bridge;
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
@@ -42,6 +43,7 @@ use tokio_util::codec::{FramedRead, FramedWrite, LinesCodec, LinesCodecError};
 use tracing::{Instrument, Span, error, info, info_span, warn};
 
 pub use cleanup::SessionSandboxCleanupConfig;
+pub use local_tool_bridge::{LocalToolBridge, PendingLocalCall, ResumeState};
 
 pub const SESSION_OUTPUT_LINE_EVENT: &str = "session.output.line";
 pub const SESSION_FIRST_TOKEN_EVENT: &str = "session.first_token";
@@ -60,6 +62,12 @@ type SessionInputSink = FramedWrite<SandboxWrite, LinesCodec>;
 type ExecutionSpanRegistry = Arc<Mutex<HashMap<String, Span>>>;
 type SessionPipeMap = Arc<DashMap<String, SessionPipe>>;
 type SessionPipeOpenLocks = Arc<DashMap<String, Arc<Mutex<()>>>>;
+type LocalToolBridgeMap = Arc<DashMap<String, Arc<LocalToolBridge>>>;
+/// Reverse index from the sandbox codex's thread_id (== its `prompt_cache_key`,
+/// captured from the `thread.started` event) to the Centaur `thread_key`. Lets
+/// the sandbox model proxy associate a generic (non-session-scoped) model call to
+/// the right session/bridge by reading `prompt_cache_key` off the request body.
+type HarnessThreadIndex = Arc<DashMap<String, String>>;
 
 #[derive(Clone)]
 pub struct SessionRuntime {
@@ -71,6 +79,14 @@ pub struct SessionRuntime {
     iron_control: Option<SessionRegistrar>,
     warm_pool: Option<Arc<WarmPoolManager>>,
     personas: Option<Arc<PersonaRegistry>>,
+    /// Per-session local-tool steering bridges, keyed by thread_key. Lazily
+    /// created; shared between the `/v1/responses` ingress and the sandbox model
+    /// proxy. Only engaged when `CENTAUR_SANDBOX_LOCAL_TOOLS` is set.
+    local_tool_bridges: LocalToolBridgeMap,
+    /// Reverse index sandbox-codex thread_id -> Centaur thread_key, populated from
+    /// the `thread.started` event. The model proxy uses it to map a generic model
+    /// call (keyed by `prompt_cache_key` = codex thread_id) back to its session.
+    harness_thread_index: HarnessThreadIndex,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -265,6 +281,7 @@ struct RuntimeContext {
     manager: Arc<SandboxManager>,
     sandbox_pipes: SessionPipeMap,
     execution_spans: ExecutionSpanRegistry,
+    harness_thread_index: HarnessThreadIndex,
 }
 
 struct EventStreamState {
@@ -322,7 +339,105 @@ impl SessionRuntime {
             iron_control: None,
             warm_pool: None,
             personas: None,
+            local_tool_bridges: Arc::new(DashMap::new()),
+            harness_thread_index: Arc::new(DashMap::new()),
         }
+    }
+
+    /// Get-or-create the local-tool steering bridge for `thread_key`.
+    pub fn local_tool_bridge(&self, thread_key: &str) -> Arc<LocalToolBridge> {
+        self.local_tool_bridges
+            .entry(thread_key.to_owned())
+            .or_insert_with(LocalToolBridge::new)
+            .clone()
+    }
+
+    /// Record the client's advertised tools on the session's bridge so the model
+    /// proxy can inject them (renamed with the `local__` prefix).
+    pub fn bridge_set_local_tools(&self, thread_key: &str, tools: Option<Value>) {
+        self.local_tool_bridge(thread_key).set_local_tools(tools);
+    }
+
+    /// The client's advertised tools recorded on the session's bridge, if any.
+    pub fn bridge_local_tools(&self, thread_key: &str) -> Option<Value> {
+        self.local_tool_bridge(thread_key).local_tools()
+    }
+
+    /// Register an in-flight local call and return the receiver the proxy
+    /// sub-loop awaits. Pushes the call to the bridge's outbound channel.
+    pub fn bridge_forward_call(
+        &self,
+        thread_key: &str,
+        call: PendingLocalCall,
+    ) -> tokio::sync::oneshot::Receiver<String> {
+        self.local_tool_bridge(thread_key).forward_call(call)
+    }
+
+    /// Take the bridge's outbound receiver (once) so the ingress can merge it
+    /// with the execution event stream.
+    pub fn bridge_take_outbound(
+        &self,
+        thread_key: &str,
+    ) -> Option<tokio::sync::mpsc::UnboundedReceiver<PendingLocalCall>> {
+        self.local_tool_bridge(thread_key).take_outbound()
+    }
+
+    /// Return the outbound receiver so a later resume request can keep merging.
+    pub fn bridge_restore_outbound(
+        &self,
+        thread_key: &str,
+        rx: tokio::sync::mpsc::UnboundedReceiver<PendingLocalCall>,
+    ) {
+        self.local_tool_bridge(thread_key).restore_outbound(rx);
+    }
+
+    /// Deliver a local tool result back to the waiting proxy sub-loop. Returns
+    /// whether a pending call with this `call_id` was matched.
+    pub fn bridge_resolve_result(&self, thread_key: &str, call_id: &str, output: String) -> bool {
+        self.local_tool_bridge(thread_key)
+            .resolve_result(call_id, output)
+    }
+
+    /// Record the suspended execution + resume offset for `thread_key`.
+    pub fn bridge_set_exec(&self, thread_key: &str, state: ResumeState) {
+        self.local_tool_bridge(thread_key).set_exec(state);
+    }
+
+    /// Take the suspended execution + resume offset for `thread_key`.
+    pub fn bridge_take_exec(&self, thread_key: &str) -> Option<ResumeState> {
+        self.local_tool_bridge(thread_key).take_exec()
+    }
+
+    /// Drop the session's bridge entirely (called once an execution completes
+    /// without a pending local call). Also evicts any harness-thread-id index
+    /// entries pointing at this session so the reverse map doesn't grow unbounded.
+    pub fn bridge_clear(&self, thread_key: &str) {
+        self.local_tool_bridges.remove(thread_key);
+        self.harness_thread_index
+            .retain(|_, mapped| mapped.as_str() != thread_key);
+    }
+
+    /// Resolve a sandbox-codex thread_id (the `prompt_cache_key` on the sandbox's
+    /// model request) to its Centaur `thread_key`, if a session has reported it via
+    /// `thread.started`. Used by the model proxy to associate a generic (non
+    /// session-scoped) model call to the right local-tool bridge.
+    pub fn thread_key_for_harness_thread_id(&self, harness_thread_id: &str) -> Option<String> {
+        self.harness_thread_index
+            .get(harness_thread_id)
+            .map(|entry| entry.value().clone())
+    }
+
+    /// Whether any active session has advertised local tools. The model proxy uses
+    /// this as a cheap gate: when no one is running local tools, every sandbox model
+    /// call keeps the streaming transparent path with zero extra work (no body
+    /// parse, no index lookup, no race retry).
+    pub fn any_local_tools_active(&self) -> bool {
+        self.local_tool_bridges.iter().any(|entry| {
+            matches!(
+                entry.value().local_tools(),
+                Some(Value::Array(ref tools)) if !tools.is_empty()
+            )
+        })
     }
 
     pub fn with_personas(mut self, personas: PersonaRegistry) -> Self {
@@ -391,6 +506,7 @@ impl SessionRuntime {
             manager: self.sandbox_runtime.manager.clone(),
             sandbox_pipes: self.sandbox_pipes.clone(),
             execution_spans: self.execution_spans.clone(),
+            harness_thread_index: self.harness_thread_index.clone(),
         }
     }
 
@@ -1566,7 +1682,7 @@ impl SessionRuntime {
                 harness_type,
                 persona_context.as_ref(),
             );
-            apply_session_sandbox_overrides(&mut spec, harness_type, overrides);
+            apply_session_sandbox_overrides(&mut spec, harness_type, thread_key, overrides);
             if let Some(principal) = iron_control_principal {
                 spec.iron_control_principal = Some(principal.to_owned());
             }
@@ -2216,8 +2332,31 @@ fn harness_server_subcommand(harness: &HarnessType) -> &'static str {
 fn apply_session_sandbox_overrides(
     spec: &mut SandboxSpec,
     harness: &HarnessType,
+    thread_key: &ThreadKey,
     overrides: SessionSandboxOverrides<'_>,
 ) {
+    // Route the sandbox codex's model calls through Centaur's proxy with the
+    // session's thread_key embedded in the URL. Gated on
+    // CENTAUR_SANDBOX_MODEL_PROXY_BASE: when unset/empty this is a no-op and the
+    // sandbox talks to its configured upstream (hydra) directly, exactly as
+    // before. Independent of harness — it only rewrites an existing
+    // CODEX_CONFIG_OVERLAY base_url, so sessions without one are untouched.
+    if let Ok(proxy_base) = std::env::var("CENTAUR_SANDBOX_MODEL_PROXY_BASE") {
+        let proxy_base = proxy_base.trim();
+        if !proxy_base.is_empty() {
+            if let Some(overlay) = spec
+                .env
+                .iter()
+                .find(|env| env.name == "CODEX_CONFIG_OVERLAY")
+                .map(|env| env.value.clone())
+            {
+                let rewritten =
+                    rewrite_codex_base_url(&overlay, proxy_base, thread_key.as_str());
+                upsert_env(spec, "CODEX_CONFIG_OVERLAY", &rewritten);
+            }
+        }
+    }
+
     // PR A intentionally scopes request model/system to ClaudeCode. Codex and
     // Amp request-level model/system handling need separate harness semantics.
     if !matches!(harness, HarnessType::ClaudeCode) {
@@ -2243,6 +2382,41 @@ fn upsert_env(spec: &mut SandboxSpec, name: &str, value: &str) {
 fn non_empty_str(value: &str) -> Option<&str> {
     let value = value.trim();
     (!value.is_empty()).then_some(value)
+}
+
+/// Rewrite the `base_url = "..."` line of a CODEX_CONFIG_OVERLAY TOML string to
+/// point the sandbox codex at Centaur's model proxy, with the session's
+/// thread_key embedded as a single percent-encoded path segment:
+/// `{proxy_base}/s/{enc(thread_key)}`.
+///
+/// All other lines (and any leading indentation on the base_url line) are
+/// preserved verbatim, as is a trailing newline. If the overlay has no
+/// `base_url = ...` line it is returned unchanged. Pure/testable.
+fn rewrite_codex_base_url(overlay: &str, proxy_base: &str, thread_key: &str) -> String {
+    let enc = urlencoding::encode(thread_key);
+    let new_base = format!("{}/s/{}", proxy_base.trim_end_matches('/'), enc);
+
+    let mut lines: Vec<String> = Vec::new();
+    for line in overlay.lines() {
+        let trimmed = line.trim_start();
+        // Match a `base_url` key assignment (TOML), ignoring leading whitespace.
+        let is_base_url = trimmed
+            .strip_prefix("base_url")
+            .map(|rest| rest.trim_start().starts_with('='))
+            .unwrap_or(false);
+        if is_base_url {
+            let indent = &line[..line.len() - trimmed.len()];
+            lines.push(format!("{indent}base_url = \"{new_base}\""));
+        } else {
+            lines.push(line.to_string());
+        }
+    }
+
+    let mut result = lines.join("\n");
+    if overlay.ends_with('\n') {
+        result.push('\n');
+    }
+    result
 }
 
 fn sandbox_spec_key(spec: &SandboxSpec) -> String {
@@ -2751,6 +2925,16 @@ async fn run_stdout_pump(
         );
         let mut output_state = StdoutPumpState::default();
         let mut line_count = 0_u64;
+        // Seed the harness-thread-id -> thread_key index from the persisted session
+        // so resumed sessions (where `thread.started` may not re-fire) are still
+        // routable by the model proxy before the first model call of this turn.
+        if let Ok(session) = ctx.store.get_session(&thread_key).await
+            && let Some(harness_thread_id) = session.harness_thread_id.as_deref()
+            && !harness_thread_id.is_empty()
+        {
+            ctx.harness_thread_index
+                .insert(harness_thread_id.to_owned(), thread_key.as_str().to_owned());
+        }
         while let Some(line) = stdout.next().await {
             let line = match line {
                 Ok(line) => line,
@@ -2762,13 +2946,19 @@ async fn run_stdout_pump(
             };
             line_count += 1;
             let output_value = serde_json::from_str::<Value>(&line).ok();
-            if let Some(harness_thread_id) = harness_thread_id_from_output_line(&line)
-                && let Err(error) = ctx
+            if let Some(harness_thread_id) = harness_thread_id_from_output_line(&line) {
+                // In-band identity for the sandbox model proxy: the sandbox codex's
+                // thread_id == its `prompt_cache_key`, so index it to this session's
+                // thread_key. Same lifetime as the local-tool bridge.
+                ctx.harness_thread_index
+                    .insert(harness_thread_id.clone(), thread_key.as_str().to_owned());
+                if let Err(error) = ctx
                     .store
                     .update_harness_thread_id(&thread_key, Some(&harness_thread_id))
                     .await
-            {
-                warn!(%thread_key, %harness_thread_id, %error, "failed to persist harness thread id");
+                {
+                    warn!(%thread_key, %harness_thread_id, %error, "failed to persist harness thread id");
+                }
             }
             let active_execution = ctx.store.active_execution_for_thread(&thread_key).await?;
             let execution_id = active_execution
@@ -4837,6 +5027,61 @@ mod tests {
     use time::OffsetDateTime;
 
     #[test]
+    fn rewrite_codex_base_url_replaces_base_url_and_preserves_other_lines() {
+        let overlay = concat!(
+            "model = \"codex\"\n",
+            "base_url = \"https://hydra.64.34.84.225.sslip.io/backend-api/codex\"\n",
+            "wire_api = \"responses\"\n",
+        );
+        let out = rewrite_codex_base_url(
+            overlay,
+            "http://centaur-centaur-api-rs.centaur:8080/sandbox/model",
+            "api:codex:abc-123",
+        );
+        assert!(out.contains("model = \"codex\""));
+        assert!(out.contains("wire_api = \"responses\""));
+        assert!(out.contains(
+            "base_url = \"http://centaur-centaur-api-rs.centaur:8080/sandbox/model/s/api%3Acodex%3Aabc-123\""
+        ));
+        // Only the base_url line changed; line count and trailing newline preserved.
+        assert_eq!(out.lines().count(), overlay.lines().count());
+        assert!(out.ends_with('\n'));
+    }
+
+    #[test]
+    fn rewrite_codex_base_url_handles_missing_base_url_gracefully() {
+        let overlay = "model = \"codex\"\nwire_api = \"responses\"\n";
+        let out = rewrite_codex_base_url(overlay, "http://proxy/sandbox/model", "api:codex:x");
+        assert_eq!(out, overlay);
+    }
+
+    #[test]
+    fn rewrite_codex_base_url_preserves_indentation() {
+        let overlay = "[model_providers.centaur]\n  base_url = \"https://old\"\n";
+        let out = rewrite_codex_base_url(overlay, "http://proxy/sandbox/model", "k");
+        assert!(out.contains("  base_url = \"http://proxy/sandbox/model/s/k\""));
+        assert!(out.starts_with("[model_providers.centaur]\n"));
+    }
+
+    #[test]
+    fn rewrite_codex_base_url_thread_key_round_trips() {
+        // Encode here; the proxy's parse_session_path decodes the same segment.
+        let out = rewrite_codex_base_url(
+            "base_url = \"https://old\"\n",
+            "http://proxy/sandbox/model",
+            "api:codex:abc-123",
+        );
+        let enc = out
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("base_url = \""))
+            .and_then(|s| s.strip_suffix('"'))
+            .and_then(|u| u.rsplit("/s/").next())
+            .unwrap();
+        let decoded = urlencoding::decode(enc).unwrap();
+        assert_eq!(decoded, "api:codex:abc-123");
+    }
+
+    #[test]
     fn persona_registry_validates_default_and_summarizes_without_prompt() {
         let registry = PersonaRegistry::new(
             [PersonaDefinition {
@@ -6243,6 +6488,7 @@ mod adoption_tests {
                 Some("sbx-old"),
                 None,
                 &execution_id,
+                SessionSandboxOverrides::default(),
             )
             .await
             .expect("resume failure should fall through to replacement");

@@ -235,13 +235,26 @@ fn run_codex_user_turn<W: Write>(
 ) -> Result<()> {
     let (model, model_provider) = model_and_provider;
     if thread_id.is_none() {
-        *thread_id = Some(start_or_resume_thread(
+        let new_thread_id = start_or_resume_thread(
             codex,
             stdout,
             request_id,
             &model_provider,
             traceparent,
-        )?);
+        )?;
+        // Emit a `thread.started` line so Centaur captures the codex thread_id.
+        // codex sets the model request's `prompt_cache_key` to this same thread_id
+        // (core/src/client.rs: prompt_cache_key = state.thread_id), so Centaur can
+        // index thread_id -> thread_key and associate the sandbox's model calls
+        // back to this session for the local-tool model proxy. Emitted once, before
+        // the first turn (so it's captured before any model call). The Responses /
+        // blocks translators already tolerate this event shape (see the mock
+        // app-server). Best-effort: a write error here shouldn't fail the turn.
+        let _ = write_value(
+            stdout,
+            &json!({ "type": "thread.started", "thread_id": new_thread_id }),
+        );
+        *thread_id = Some(new_thread_id);
         *thread_provider = Some(model_provider.clone());
     } else if let (Some(requested), Some(pinned)) =
         (requested_provider.as_deref(), thread_provider.as_deref())

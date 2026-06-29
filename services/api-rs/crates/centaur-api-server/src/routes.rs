@@ -53,7 +53,7 @@ use tracing::Span;
 use uuid::Uuid;
 
 use crate::{
-    ApiError, anthropic, openai,
+    ApiError, anthropic, model_proxy::proxy_sandbox_model, openai,
     types::{
         AppendMessagesRequest, AppendMessagesResponse, CreateSessionRequest, CreateSessionResponse,
         EmitWorkflowEventRequest, EventsQuery, ExecuteSessionRequest, ExecuteSessionResponse,
@@ -196,6 +196,21 @@ pub fn build_router_with_app_state(state: AppState) -> Router {
         .route(
             "/v1/responses",
             post(openai::create_response).layer(DefaultBodyLimit::disable()),
+        )
+        // Transparent reverse-proxy for the sandbox agent's model calls (step 1
+        // of local<->sandbox tool unification). Lets Centaur sit on the
+        // sandbox->model path so it can later inject/route client tools.
+        .route(
+            "/sandbox/model/{*rest}",
+            any(proxy_sandbox_model).layer(DefaultBodyLimit::disable()),
+        )
+        // Egress-pivot landing: codex ignores config.toml base_url, so its model
+        // calls can only be routed to Centaur at the network layer (CoreDNS
+        // rewrite of the hydra host -> this svc). Such calls arrive on the hydra
+        // `/backend-api/...` path. Inert (404) until CENTAUR_HYDRA_PATH_PROXY is set.
+        .route(
+            "/backend-api/{*rest}",
+            any(crate::model_proxy::proxy_hydra_ingress).layer(DefaultBodyLimit::disable()),
         )
         .route(
             "/api/session/{thread_key}",
