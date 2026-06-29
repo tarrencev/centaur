@@ -63,6 +63,11 @@ type ExecutionSpanRegistry = Arc<Mutex<HashMap<String, Span>>>;
 type SessionPipeMap = Arc<DashMap<String, SessionPipe>>;
 type SessionPipeOpenLocks = Arc<DashMap<String, Arc<Mutex<()>>>>;
 type LocalToolBridgeMap = Arc<DashMap<String, Arc<LocalToolBridge>>>;
+/// Reverse index from the sandbox codex's thread_id (== its `prompt_cache_key`,
+/// captured from the `thread.started` event) to the Centaur `thread_key`. Lets
+/// the sandbox model proxy associate a generic (non-session-scoped) model call to
+/// the right session/bridge by reading `prompt_cache_key` off the request body.
+type HarnessThreadIndex = Arc<DashMap<String, String>>;
 
 #[derive(Clone)]
 pub struct SessionRuntime {
@@ -78,6 +83,10 @@ pub struct SessionRuntime {
     /// created; shared between the `/v1/responses` ingress and the sandbox model
     /// proxy. Only engaged when `CENTAUR_SANDBOX_LOCAL_TOOLS` is set.
     local_tool_bridges: LocalToolBridgeMap,
+    /// Reverse index sandbox-codex thread_id -> Centaur thread_key, populated from
+    /// the `thread.started` event. The model proxy uses it to map a generic model
+    /// call (keyed by `prompt_cache_key` = codex thread_id) back to its session.
+    harness_thread_index: HarnessThreadIndex,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -272,6 +281,7 @@ struct RuntimeContext {
     manager: Arc<SandboxManager>,
     sandbox_pipes: SessionPipeMap,
     execution_spans: ExecutionSpanRegistry,
+    harness_thread_index: HarnessThreadIndex,
 }
 
 struct EventStreamState {
@@ -330,6 +340,7 @@ impl SessionRuntime {
             warm_pool: None,
             personas: None,
             local_tool_bridges: Arc::new(DashMap::new()),
+            harness_thread_index: Arc::new(DashMap::new()),
         }
     }
 
@@ -398,9 +409,35 @@ impl SessionRuntime {
     }
 
     /// Drop the session's bridge entirely (called once an execution completes
-    /// without a pending local call).
+    /// without a pending local call). Also evicts any harness-thread-id index
+    /// entries pointing at this session so the reverse map doesn't grow unbounded.
     pub fn bridge_clear(&self, thread_key: &str) {
         self.local_tool_bridges.remove(thread_key);
+        self.harness_thread_index
+            .retain(|_, mapped| mapped.as_str() != thread_key);
+    }
+
+    /// Resolve a sandbox-codex thread_id (the `prompt_cache_key` on the sandbox's
+    /// model request) to its Centaur `thread_key`, if a session has reported it via
+    /// `thread.started`. Used by the model proxy to associate a generic (non
+    /// session-scoped) model call to the right local-tool bridge.
+    pub fn thread_key_for_harness_thread_id(&self, harness_thread_id: &str) -> Option<String> {
+        self.harness_thread_index
+            .get(harness_thread_id)
+            .map(|entry| entry.value().clone())
+    }
+
+    /// Whether any active session has advertised local tools. The model proxy uses
+    /// this as a cheap gate: when no one is running local tools, every sandbox model
+    /// call keeps the streaming transparent path with zero extra work (no body
+    /// parse, no index lookup, no race retry).
+    pub fn any_local_tools_active(&self) -> bool {
+        self.local_tool_bridges.iter().any(|entry| {
+            matches!(
+                entry.value().local_tools(),
+                Some(Value::Array(ref tools)) if !tools.is_empty()
+            )
+        })
     }
 
     pub fn with_personas(mut self, personas: PersonaRegistry) -> Self {
@@ -469,6 +506,7 @@ impl SessionRuntime {
             manager: self.sandbox_runtime.manager.clone(),
             sandbox_pipes: self.sandbox_pipes.clone(),
             execution_spans: self.execution_spans.clone(),
+            harness_thread_index: self.harness_thread_index.clone(),
         }
     }
 
@@ -2887,6 +2925,16 @@ async fn run_stdout_pump(
         );
         let mut output_state = StdoutPumpState::default();
         let mut line_count = 0_u64;
+        // Seed the harness-thread-id -> thread_key index from the persisted session
+        // so resumed sessions (where `thread.started` may not re-fire) are still
+        // routable by the model proxy before the first model call of this turn.
+        if let Ok(session) = ctx.store.get_session(&thread_key).await
+            && let Some(harness_thread_id) = session.harness_thread_id.as_deref()
+            && !harness_thread_id.is_empty()
+        {
+            ctx.harness_thread_index
+                .insert(harness_thread_id.to_owned(), thread_key.as_str().to_owned());
+        }
         while let Some(line) = stdout.next().await {
             let line = match line {
                 Ok(line) => line,
@@ -2898,13 +2946,19 @@ async fn run_stdout_pump(
             };
             line_count += 1;
             let output_value = serde_json::from_str::<Value>(&line).ok();
-            if let Some(harness_thread_id) = harness_thread_id_from_output_line(&line)
-                && let Err(error) = ctx
+            if let Some(harness_thread_id) = harness_thread_id_from_output_line(&line) {
+                // In-band identity for the sandbox model proxy: the sandbox codex's
+                // thread_id == its `prompt_cache_key`, so index it to this session's
+                // thread_key. Same lifetime as the local-tool bridge.
+                ctx.harness_thread_index
+                    .insert(harness_thread_id.clone(), thread_key.as_str().to_owned());
+                if let Err(error) = ctx
                     .store
                     .update_harness_thread_id(&thread_key, Some(&harness_thread_id))
                     .await
-            {
-                warn!(%thread_key, %harness_thread_id, %error, "failed to persist harness thread id");
+                {
+                    warn!(%thread_key, %harness_thread_id, %error, "failed to persist harness thread id");
+                }
             }
             let active_execution = ctx.store.active_execution_for_thread(&thread_key).await?;
             let execution_id = active_execution

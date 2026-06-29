@@ -98,20 +98,42 @@ pub async fn proxy_sandbox_model(State(state): State<AppState>, req: Request) ->
     // Real local-tool routing (step 3) takes precedence over the step-2 stub. It
     // requires a session thread_key (to reach the right bridge) and the live
     // runtime; if either is missing we fall through to the stub/transparent path.
+    //
+    // Two ways to associate a request to its session:
+    //   1. an explicit `/s/{enc}` path segment (per-session base_url; legacy), or
+    //   2. the generic egress path — read `prompt_cache_key` (== the sandbox codex
+    //      thread_id == the session's `harness_thread_id`) off the Responses body
+    //      and reverse-map it to the thread_key via the runtime. This is the
+    //      warm-pool-safe association used by the generic proxy base_url.
     if is_responses
         && real_enabled
-        && let (Some(thread_key), Ok(runtime)) =
-            (session_thread_key.as_deref(), state.runtime())
+        && let Ok(runtime) = state.runtime()
+        // Cheap gate: only pay body-parse + index lookup + race retry when some
+        // session is actually running local tools. Otherwise fall straight through
+        // to the streaming transparent pass-through below.
+        && (session_thread_key.is_some() || runtime.any_local_tools_active())
     {
-        return proxy_with_local_bridge(
-            &runtime,
-            thread_key,
-            &parts.method,
-            &url,
-            &parts.headers,
-            body_bytes,
-        )
-        .await;
+        let thread_key = match session_thread_key.as_deref() {
+            Some(tk) => Some(tk.to_owned()),
+            None => resolve_thread_key_from_body(&runtime, &body_bytes).await,
+        };
+        // Only engage the (buffering, non-streaming) local-tool sub-loop when this
+        // session actually advertised local tools. With a generic proxy base_url
+        // every sandbox model call lands here; normal sessions (no local CLI tools)
+        // must keep the streaming transparent pass-through instead of being buffered.
+        if let Some(thread_key) = thread_key
+            && has_local_tools(&runtime, &thread_key)
+        {
+            return proxy_with_local_bridge(
+                &runtime,
+                &thread_key,
+                &parts.method,
+                &url,
+                &parts.headers,
+                body_bytes,
+            )
+            .await;
+        }
     }
 
     if is_responses && stub_enabled {
@@ -148,6 +170,61 @@ fn parse_session_path(rest: &str) -> (Option<String>, String) {
         .map(|s| s.into_owned())
         .unwrap_or_else(|_| segment.to_string());
     (Some(decoded), tail.to_string())
+}
+
+/// Number of times to re-check the harness-thread-id index before giving up. The
+/// sandbox codex's first model call can narrowly beat the `thread.started` event
+/// that populates the index; a short bounded retry absorbs that race without
+/// stalling unrelated turns (the index is already populated for those).
+const THREAD_KEY_LOOKUP_RETRIES: usize = 10;
+const THREAD_KEY_LOOKUP_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Extract the `prompt_cache_key` from a Responses request body. codex sets it to
+/// its thread_id (== the session's `harness_thread_id`), which the runtime indexes
+/// to the Centaur thread_key. Returns `None` if the body isn't JSON or carries no
+/// `prompt_cache_key`.
+fn extract_prompt_cache_key(body: &[u8]) -> Option<String> {
+    let value: Value = serde_json::from_slice(body).ok()?;
+    value
+        .get("prompt_cache_key")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+        .map(str::to_owned)
+}
+
+/// Whether the session's bridge advertises any local tools. Gates the buffering
+/// sub-loop so only sessions with a local CLI (advertising tools) pay the
+/// non-streaming cost; everything else keeps the streaming transparent path.
+fn has_local_tools(runtime: &SessionRuntime, thread_key: &str) -> bool {
+    matches!(
+        runtime.bridge_local_tools(thread_key),
+        Some(Value::Array(ref tools)) if !tools.is_empty()
+    )
+}
+
+/// Resolve the Centaur thread_key for a generic (non session-scoped) sandbox model
+/// call by reading its `prompt_cache_key` and reverse-mapping through the runtime,
+/// briefly retrying to absorb the `thread.started` race. Returns `None` when the
+/// body has no `prompt_cache_key` or no session has reported that id.
+async fn resolve_thread_key_from_body(
+    runtime: &SessionRuntime,
+    body: &[u8],
+) -> Option<String> {
+    let cache_key = extract_prompt_cache_key(body)?;
+    for attempt in 0..THREAD_KEY_LOOKUP_RETRIES {
+        if let Some(thread_key) = runtime.thread_key_for_harness_thread_id(&cache_key) {
+            return Some(thread_key);
+        }
+        if attempt + 1 < THREAD_KEY_LOOKUP_RETRIES {
+            tokio::time::sleep(THREAD_KEY_LOOKUP_INTERVAL).await;
+        }
+    }
+    tracing::debug!(
+        prompt_cache_key = %cache_key,
+        "sandbox model proxy: no session indexed for prompt_cache_key; passing through"
+    );
+    None
 }
 
 /// Build the upstream request: forward method/headers/body, drop hop-by-hop and
@@ -782,6 +859,26 @@ mod tests {
         let (tk, path) = parse_session_path("/s/k/responses?stream=true");
         assert_eq!(tk.as_deref(), Some("k"));
         assert_eq!(path, "/responses?stream=true");
+    }
+
+    #[test]
+    fn extract_prompt_cache_key_reads_string_value() {
+        let body = br#"{"model":"gpt-5.5","prompt_cache_key":"codex-thread-abc","input":[]}"#;
+        assert_eq!(
+            extract_prompt_cache_key(body).as_deref(),
+            Some("codex-thread-abc")
+        );
+    }
+
+    #[test]
+    fn extract_prompt_cache_key_none_when_absent_or_blank() {
+        assert_eq!(extract_prompt_cache_key(br#"{"model":"gpt-5.5"}"#), None);
+        assert_eq!(
+            extract_prompt_cache_key(br#"{"prompt_cache_key":"  "}"#),
+            None
+        );
+        // Non-JSON body never panics.
+        assert_eq!(extract_prompt_cache_key(b"not json"), None);
     }
 
     #[test]
