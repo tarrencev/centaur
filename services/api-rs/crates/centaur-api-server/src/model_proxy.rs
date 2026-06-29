@@ -509,6 +509,16 @@ async fn proxy_with_local_bridge(
     append_env_guidance(&mut request_body);
     rename_native_tools_to_sandbox(&mut request_body);
     let local_tools = runtime.bridge_local_tools(thread_key);
+    let injected = local_tools
+        .as_ref()
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
+    tracing::info!(
+        thread_key = %thread_key,
+        injected_local_tools = injected,
+        "sandbox model proxy: local-tool bridge engaged"
+    );
     inject_bridge_local_tools(&mut request_body, local_tools.as_ref());
 
     for _ in 0..MAX_SUBLOOP_ITERATIONS {
@@ -596,6 +606,12 @@ async fn proxy_with_local_bridge(
         // its result, then append the followup and re-query upstream.
         for call in local_calls {
             let real_name = strip_local_prefix(&call.name).to_owned();
+            tracing::info!(
+                thread_key = %thread_key,
+                call_id = %call.call_id,
+                name = %real_name,
+                "sandbox model proxy: forwarding local tool call to client"
+            );
             let rx = runtime.bridge_forward_call(
                 thread_key,
                 PendingLocalCall {
@@ -605,7 +621,15 @@ async fn proxy_with_local_bridge(
                 },
             );
             let output = match tokio::time::timeout(LOCAL_CALL_TIMEOUT, rx).await {
-                Ok(Ok(output)) => output,
+                Ok(Ok(output)) => {
+                    tracing::info!(
+                        thread_key = %thread_key,
+                        call_id = %call.call_id,
+                        output_len = output.len(),
+                        "sandbox model proxy: local tool result received"
+                    );
+                    output
+                }
                 Ok(Err(_)) => {
                     // Ingress dropped the sender without resolving (e.g. client
                     // disconnected). Surface a tool error to the model.

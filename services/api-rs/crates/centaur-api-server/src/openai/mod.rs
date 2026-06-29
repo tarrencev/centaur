@@ -180,11 +180,29 @@ pub(crate) async fn create_response(
     // continue streaming the same execution from where it left off, rather than
     // starting a new turn.
     if local_tools_enabled() {
+        let tool_count = request
+            .tools
+            .as_ref()
+            .and_then(Value::as_array)
+            .map(Vec::len)
+            .unwrap_or(0);
+        tracing::info!(
+            thread_key = %thread_key,
+            local_tool_count = tool_count,
+            "local-tool bridge: recording client tools"
+        );
         runtime.bridge_set_local_tools(thread_key.as_str(), request.tools.clone());
         let outputs = function_call_outputs(&request.input);
         let mut resolved_any = false;
         for (call_id, output) in &outputs {
-            if runtime.bridge_resolve_result(thread_key.as_str(), call_id, output.clone()) {
+            let matched = runtime.bridge_resolve_result(thread_key.as_str(), call_id, output.clone());
+            tracing::info!(
+                thread_key = %thread_key,
+                call_id = %call_id,
+                matched,
+                "local-tool bridge: resolve function_call_output"
+            );
+            if matched {
                 resolved_any = true;
             }
         }
@@ -601,6 +619,12 @@ fn bridge_stream_response(
                 maybe_call = recv_outbound(&mut state.outbound) => {
                     match maybe_call {
                         Some(call) => {
+                            tracing::info!(
+                                thread_key = %state.thread_key,
+                                call_id = %call.call_id,
+                                name = %call.name,
+                                "local-tool bridge: emitting local tool_use to client (suspend)"
+                            );
                             let mut buf = Vec::new();
                             state.translator.emit_function_call(
                                 &call.name,
