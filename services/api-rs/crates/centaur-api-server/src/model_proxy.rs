@@ -13,15 +13,18 @@
 //! re-query sub-loop, so the sandbox agent (codex) never sees those tools or
 //! their calls. Everything else keeps the byte-for-byte transparent pass-through.
 
-use std::env;
+use std::{env, time::Duration};
 
 use axum::{
     body::{Body, Bytes},
-    extract::Request,
+    extract::{Request, State},
     http::{HeaderMap, Method, StatusCode},
     response::{IntoResponse, Response},
 };
+use centaur_session_runtime::{PendingLocalCall, SessionRuntime};
 use serde_json::{Value, json};
+
+use crate::routes::AppState;
 
 /// Shared client for the sandbox model-proxy.
 static MODEL_PROXY_CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
@@ -34,6 +37,11 @@ const LOCAL_TOOL_PREFIX: &str = "local__";
 /// Upper bound on local-tool re-query iterations before we bail with an error,
 /// to avoid an unbounded loop if the model keeps calling local tools.
 const MAX_SUBLOOP_ITERATIONS: usize = 16;
+
+/// How long the proxy sub-loop waits for the user's local CLI to return a tool
+/// result before giving up on a forwarded local call (the CLI must execute the
+/// tool and post the `function_call_output` back through `/v1/responses`).
+const LOCAL_CALL_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// A function call extracted from a Responses SSE stream.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,7 +59,7 @@ pub struct FunctionCall {
 /// targets the Responses `.../responses` endpoint AND
 /// `CENTAUR_SANDBOX_LOCAL_TOOLS_STUB` is set, in which case it engages the
 /// local-tool buffering sub-loop (step 2).
-pub async fn proxy_sandbox_model(req: Request) -> Response {
+pub async fn proxy_sandbox_model(State(state): State<AppState>, req: Request) -> Response {
     let (parts, body) = req.into_parts();
     let path_and_query = parts
         .uri
@@ -80,19 +88,42 @@ pub async fn proxy_sandbox_model(req: Request) -> Response {
         }
     };
 
-    // Only the Responses wire format on `.../responses` with the stub flag set
-    // takes the buffering sub-loop path; everything else is the transparent
-    // streaming pass-through from step 1 (byte-for-byte unchanged).
+    // Only the Responses wire format on `.../responses` takes a buffering
+    // sub-loop path; everything else is the transparent streaming pass-through
+    // from step 1 (byte-for-byte unchanged).
     let is_responses = parts.uri.path().trim_end_matches('/').ends_with("/responses");
-    let stub_enabled = env::var("CENTAUR_SANDBOX_LOCAL_TOOLS_STUB")
-        .map(|v| !v.trim().is_empty())
-        .unwrap_or(false);
+    let real_enabled = env_flag("CENTAUR_SANDBOX_LOCAL_TOOLS");
+    let stub_enabled = env_flag("CENTAUR_SANDBOX_LOCAL_TOOLS_STUB");
+
+    // Real local-tool routing (step 3) takes precedence over the step-2 stub. It
+    // requires a session thread_key (to reach the right bridge) and the live
+    // runtime; if either is missing we fall through to the stub/transparent path.
+    if is_responses
+        && real_enabled
+        && let (Some(thread_key), Ok(runtime)) =
+            (session_thread_key.as_deref(), state.runtime())
+    {
+        return proxy_with_local_bridge(
+            &runtime,
+            thread_key,
+            &parts.method,
+            &url,
+            &parts.headers,
+            body_bytes,
+        )
+        .await;
+    }
 
     if is_responses && stub_enabled {
         proxy_with_local_tools(&parts.method, &url, &parts.headers, body_bytes).await
     } else {
         transparent_passthrough(&parts.method, &url, &parts.headers, body_bytes).await
     }
+}
+
+/// Read a boolean-ish env flag: set and non-empty (after trim) => true.
+fn env_flag(name: &str) -> bool {
+    env::var(name).map(|v| !v.trim().is_empty()).unwrap_or(false)
 }
 
 /// Split an optional leading `/s/{enc_thread_key}` session segment off the
@@ -290,10 +321,184 @@ async fn proxy_with_local_tools(
         .into_response()
 }
 
+/// Step-3 behavior: inject the *client's* tools (renamed with the `local__`
+/// prefix) into the Responses request, buffer the upstream SSE, and for each
+/// `local__` call forward it to the user's local CLI through the session bridge,
+/// blocking on its result before re-querying upstream. Mirrors
+/// [`proxy_with_local_tools`] but routes to the real CLI instead of a stub.
+async fn proxy_with_local_bridge(
+    runtime: &SessionRuntime,
+    thread_key: &str,
+    method: &Method,
+    url: &str,
+    headers: &HeaderMap,
+    body_bytes: Bytes,
+) -> Response {
+    let mut request_body: Value = match serde_json::from_slice(&body_bytes) {
+        Ok(value) => value,
+        Err(err) => {
+            tracing::warn!(error = %err, "sandbox model proxy: /responses body not JSON; passing through");
+            return transparent_passthrough(method, url, headers, body_bytes).await;
+        }
+    };
+
+    // Inject the client's advertised tools (renamed). With no client tools this
+    // is a no-op and the loop degenerates to a single transparent re-emit.
+    let local_tools = runtime.bridge_local_tools(thread_key);
+    inject_bridge_local_tools(&mut request_body, local_tools.as_ref());
+
+    for _ in 0..MAX_SUBLOOP_ITERATIONS {
+        let serialized = match serde_json::to_vec(&request_body) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("model proxy: serialize request: {err}"),
+                )
+                    .into_response();
+            }
+        };
+
+        let outbound = build_outbound(method, url, headers, serialized);
+        let upstream_resp = match outbound.send().await {
+            Ok(resp) => resp,
+            Err(err) => {
+                tracing::error!(error = %err, url = %url, "sandbox model proxy upstream error");
+                return (StatusCode::BAD_GATEWAY, format!("model proxy upstream error: {err}"))
+                    .into_response();
+            }
+        };
+
+        let status = upstream_resp.status();
+        let resp_headers = upstream_resp.headers().clone();
+        let collected = match upstream_resp.bytes().await {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                tracing::error!(error = %err, "sandbox model proxy: collect upstream body");
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    format!("model proxy collect error: {err}"),
+                )
+                    .into_response();
+            }
+        };
+
+        let sse = String::from_utf8_lossy(&collected);
+        let calls = parse_function_calls(&sse);
+        let local_calls: Vec<&FunctionCall> = calls.iter().filter(|c| is_local(&c.name)).collect();
+
+        if local_calls.is_empty() {
+            // No local tool call — re-emit the collected SSE verbatim (sandbox
+            // function_call or plain message), same as the transparent path.
+            let mut builder = Response::builder().status(status.as_u16());
+            for (name, value) in resp_headers.iter() {
+                match name.as_str() {
+                    "content-length" | "transfer-encoding" | "connection" => continue,
+                    _ => builder = builder.header(name.clone(), value.clone()),
+                }
+            }
+            return match builder.body(Body::from(collected)) {
+                Ok(resp) => resp,
+                Err(err) => {
+                    tracing::error!(error = %err, "sandbox model proxy response build failed");
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "model proxy response build failed",
+                    )
+                        .into_response()
+                }
+            };
+        }
+
+        // Forward each local call to the user's CLI via the bridge and block on
+        // its result, then append the followup and re-query upstream.
+        for call in local_calls {
+            let real_name = strip_local_prefix(&call.name).to_owned();
+            let rx = runtime.bridge_forward_call(
+                thread_key,
+                PendingLocalCall {
+                    call_id: call.call_id.clone(),
+                    name: real_name,
+                    arguments: call.arguments.clone(),
+                },
+            );
+            let output = match tokio::time::timeout(LOCAL_CALL_TIMEOUT, rx).await {
+                Ok(Ok(output)) => output,
+                Ok(Err(_)) => {
+                    // Ingress dropped the sender without resolving (e.g. client
+                    // disconnected). Surface a tool error to the model.
+                    json!({ "error": "local tool channel closed before a result was returned" })
+                        .to_string()
+                }
+                Err(_) => {
+                    tracing::error!(
+                        thread_key = %thread_key,
+                        call_id = %call.call_id,
+                        "sandbox model proxy: local tool call timed out"
+                    );
+                    return (
+                        StatusCode::GATEWAY_TIMEOUT,
+                        format!(
+                            "model proxy: local tool '{}' timed out after {}s",
+                            call.name,
+                            LOCAL_CALL_TIMEOUT.as_secs()
+                        ),
+                    )
+                        .into_response();
+                }
+            };
+            append_followup(&mut request_body, call, &output);
+        }
+    }
+
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        format!("model proxy: local tool sub-loop exceeded {MAX_SUBLOOP_ITERATIONS} iterations"),
+    )
+        .into_response()
+}
+
 /// Returns true if `name` is tagged as a local tool (routed through the
 /// sub-loop rather than surfaced to the sandbox agent).
 pub fn is_local(name: &str) -> bool {
     name.starts_with(LOCAL_TOOL_PREFIX)
+}
+
+/// Strip the `local__` routing prefix from a tool name, yielding the real client
+/// tool name. Names without the prefix are returned unchanged.
+pub fn strip_local_prefix(name: &str) -> &str {
+    name.strip_prefix(LOCAL_TOOL_PREFIX).unwrap_or(name)
+}
+
+/// Inject the client's advertised tools into the Responses request's `tools`
+/// array, each renamed with the `local__` prefix so the sandbox model's calls to
+/// them are routable back through the bridge. Only object entries with a string
+/// `name` are renamed and forwarded (e.g. `exec_command` -> `local__exec_command`);
+/// entries without a name (e.g. typed built-ins) are passed through unchanged so
+/// we never drop a tool we don't understand. A `None`/empty tool set is a no-op.
+pub fn inject_bridge_local_tools(body: &mut Value, local_tools: Option<&Value>) {
+    let Some(Value::Array(tools)) = local_tools else {
+        return;
+    };
+    if tools.is_empty() {
+        return;
+    }
+    let renamed: Vec<Value> = tools
+        .iter()
+        .cloned()
+        .map(|mut tool| {
+            if let Some(name) = tool.get("name").and_then(Value::as_str) {
+                let prefixed = format!("{LOCAL_TOOL_PREFIX}{name}");
+                tool["name"] = Value::String(prefixed);
+            }
+            tool
+        })
+        .collect();
+
+    match body.get_mut("tools") {
+        Some(Value::Array(existing)) => existing.extend(renamed),
+        _ => body["tools"] = Value::Array(renamed),
+    }
 }
 
 /// Inject the fixed stub set of local tools into the Responses request's
@@ -638,6 +843,56 @@ mod tests {
         assert_eq!(fco["type"], "function_call_output");
         assert_eq!(fco["call_id"], "call_abc");
         assert_eq!(fco["output"], r#"{"echo":"hi"}"#);
+    }
+
+    #[test]
+    fn strip_local_prefix_strips_only_the_prefix() {
+        assert_eq!(strip_local_prefix("local__exec_command"), "exec_command");
+        assert_eq!(strip_local_prefix("local__write_stdin"), "write_stdin");
+        // Idempotent / unprefixed names pass through unchanged.
+        assert_eq!(strip_local_prefix("exec_command"), "exec_command");
+        assert_eq!(strip_local_prefix(""), "");
+    }
+
+    #[test]
+    fn inject_bridge_local_tools_prefixes_named_tools() {
+        let mut body = json!({ "model": "codex", "input": [] });
+        let local = json!([
+            { "type": "function", "name": "exec_command", "parameters": {} },
+            { "type": "function", "name": "write_stdin", "parameters": {} },
+            // No name (typed built-in) -> passed through unchanged.
+            { "type": "web_search" },
+        ]);
+        inject_bridge_local_tools(&mut body, Some(&local));
+
+        let tools = body["tools"].as_array().expect("tools array created");
+        assert_eq!(tools.len(), 3);
+        assert_eq!(tools[0]["name"], "local__exec_command");
+        assert_eq!(tools[1]["name"], "local__write_stdin");
+        assert_eq!(tools[2]["type"], "web_search");
+        assert!(tools[2].get("name").is_none());
+    }
+
+    #[test]
+    fn inject_bridge_local_tools_appends_to_existing_array() {
+        let mut body = json!({ "tools": [{ "type": "function", "name": "sandbox__shell" }] });
+        let local = json!([{ "type": "function", "name": "exec_command" }]);
+        inject_bridge_local_tools(&mut body, Some(&local));
+
+        let tools = body["tools"].as_array().expect("tools array");
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0]["name"], "sandbox__shell");
+        assert_eq!(tools[1]["name"], "local__exec_command");
+    }
+
+    #[test]
+    fn inject_bridge_local_tools_noop_when_empty_or_absent() {
+        let mut body = json!({ "model": "codex" });
+        inject_bridge_local_tools(&mut body, None);
+        assert!(body.get("tools").is_none());
+
+        inject_bridge_local_tools(&mut body, Some(&json!([])));
+        assert!(body.get("tools").is_none());
     }
 
     #[test]

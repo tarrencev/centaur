@@ -1,4 +1,5 @@
 mod cleanup;
+mod local_tool_bridge;
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
@@ -42,6 +43,7 @@ use tokio_util::codec::{FramedRead, FramedWrite, LinesCodec, LinesCodecError};
 use tracing::{Instrument, Span, error, info, info_span, warn};
 
 pub use cleanup::SessionSandboxCleanupConfig;
+pub use local_tool_bridge::{LocalToolBridge, PendingLocalCall, ResumeState};
 
 pub const SESSION_OUTPUT_LINE_EVENT: &str = "session.output.line";
 pub const SESSION_FIRST_TOKEN_EVENT: &str = "session.first_token";
@@ -60,6 +62,7 @@ type SessionInputSink = FramedWrite<SandboxWrite, LinesCodec>;
 type ExecutionSpanRegistry = Arc<Mutex<HashMap<String, Span>>>;
 type SessionPipeMap = Arc<DashMap<String, SessionPipe>>;
 type SessionPipeOpenLocks = Arc<DashMap<String, Arc<Mutex<()>>>>;
+type LocalToolBridgeMap = Arc<DashMap<String, Arc<LocalToolBridge>>>;
 
 #[derive(Clone)]
 pub struct SessionRuntime {
@@ -71,6 +74,10 @@ pub struct SessionRuntime {
     iron_control: Option<SessionRegistrar>,
     warm_pool: Option<Arc<WarmPoolManager>>,
     personas: Option<Arc<PersonaRegistry>>,
+    /// Per-session local-tool steering bridges, keyed by thread_key. Lazily
+    /// created; shared between the `/v1/responses` ingress and the sandbox model
+    /// proxy. Only engaged when `CENTAUR_SANDBOX_LOCAL_TOOLS` is set.
+    local_tool_bridges: LocalToolBridgeMap,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -322,7 +329,78 @@ impl SessionRuntime {
             iron_control: None,
             warm_pool: None,
             personas: None,
+            local_tool_bridges: Arc::new(DashMap::new()),
         }
+    }
+
+    /// Get-or-create the local-tool steering bridge for `thread_key`.
+    pub fn local_tool_bridge(&self, thread_key: &str) -> Arc<LocalToolBridge> {
+        self.local_tool_bridges
+            .entry(thread_key.to_owned())
+            .or_insert_with(LocalToolBridge::new)
+            .clone()
+    }
+
+    /// Record the client's advertised tools on the session's bridge so the model
+    /// proxy can inject them (renamed with the `local__` prefix).
+    pub fn bridge_set_local_tools(&self, thread_key: &str, tools: Option<Value>) {
+        self.local_tool_bridge(thread_key).set_local_tools(tools);
+    }
+
+    /// The client's advertised tools recorded on the session's bridge, if any.
+    pub fn bridge_local_tools(&self, thread_key: &str) -> Option<Value> {
+        self.local_tool_bridge(thread_key).local_tools()
+    }
+
+    /// Register an in-flight local call and return the receiver the proxy
+    /// sub-loop awaits. Pushes the call to the bridge's outbound channel.
+    pub fn bridge_forward_call(
+        &self,
+        thread_key: &str,
+        call: PendingLocalCall,
+    ) -> tokio::sync::oneshot::Receiver<String> {
+        self.local_tool_bridge(thread_key).forward_call(call)
+    }
+
+    /// Take the bridge's outbound receiver (once) so the ingress can merge it
+    /// with the execution event stream.
+    pub fn bridge_take_outbound(
+        &self,
+        thread_key: &str,
+    ) -> Option<tokio::sync::mpsc::UnboundedReceiver<PendingLocalCall>> {
+        self.local_tool_bridge(thread_key).take_outbound()
+    }
+
+    /// Return the outbound receiver so a later resume request can keep merging.
+    pub fn bridge_restore_outbound(
+        &self,
+        thread_key: &str,
+        rx: tokio::sync::mpsc::UnboundedReceiver<PendingLocalCall>,
+    ) {
+        self.local_tool_bridge(thread_key).restore_outbound(rx);
+    }
+
+    /// Deliver a local tool result back to the waiting proxy sub-loop. Returns
+    /// whether a pending call with this `call_id` was matched.
+    pub fn bridge_resolve_result(&self, thread_key: &str, call_id: &str, output: String) -> bool {
+        self.local_tool_bridge(thread_key)
+            .resolve_result(call_id, output)
+    }
+
+    /// Record the suspended execution + resume offset for `thread_key`.
+    pub fn bridge_set_exec(&self, thread_key: &str, state: ResumeState) {
+        self.local_tool_bridge(thread_key).set_exec(state);
+    }
+
+    /// Take the suspended execution + resume offset for `thread_key`.
+    pub fn bridge_take_exec(&self, thread_key: &str) -> Option<ResumeState> {
+        self.local_tool_bridge(thread_key).take_exec()
+    }
+
+    /// Drop the session's bridge entirely (called once an execution completes
+    /// without a pending local call).
+    pub fn bridge_clear(&self, thread_key: &str) {
+        self.local_tool_bridges.remove(thread_key);
     }
 
     pub fn with_personas(mut self, personas: PersonaRegistry) -> Self {
