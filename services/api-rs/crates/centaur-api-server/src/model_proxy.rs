@@ -34,6 +34,18 @@ static MODEL_PROXY_CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::Onc
 /// being surfaced to the sandbox agent.
 const LOCAL_TOOL_PREFIX: &str = "local__";
 
+/// Prefix tagging the sandbox agent's OWN tools, so the model sees a symmetric,
+/// environment-labeled menu (`sandbox__*` vs `local__*`) and can choose where to
+/// act. The proxy renames codex's native tools to this on the way out and strips
+/// it from the returned `function_call`s so codex still sees its real tool names.
+const SANDBOX_TOOL_PREFIX: &str = "sandbox__";
+
+/// Whether a tool name already carries an environment prefix (so renames stay
+/// idempotent across sub-loop iterations and codex re-queries).
+fn is_env_prefixed(name: &str) -> bool {
+    name.starts_with(LOCAL_TOOL_PREFIX) || name.starts_with(SANDBOX_TOOL_PREFIX)
+}
+
 /// Upper bound on local-tool re-query iterations before we bail with an error,
 /// to avoid an unbounded loop if the model keeps calling local tools.
 const MAX_SUBLOOP_ITERATIONS: usize = 16;
@@ -489,12 +501,20 @@ async fn proxy_with_local_bridge(
         }
     };
 
-    // Inject the client's advertised tools (renamed). With no client tools this
-    // is a no-op and the loop degenerates to a single transparent re-emit.
+    // Symmetric environment namespacing: tag the sandbox agent's own tools
+    // `sandbox__*` and inject the client's tools as `local__*`, then tell the model
+    // (via `instructions`) how to choose. The model picks an environment per call;
+    // `sandbox__*` calls are handed back to codex (prefix stripped) and `local__*`
+    // calls are forwarded to the user's CLI. Done once; renames are idempotent.
+    append_env_guidance(&mut request_body);
+    rename_native_tools_to_sandbox(&mut request_body);
     let local_tools = runtime.bridge_local_tools(thread_key);
     inject_bridge_local_tools(&mut request_body, local_tools.as_ref());
 
     for _ in 0..MAX_SUBLOOP_ITERATIONS {
+        // Keep history tool names consistent with the renamed `tools[]` (codex's
+        // prior calls -> `sandbox__*`; proxy-appended `local__*` left as-is).
+        rename_input_history_to_sandbox(&mut request_body);
         let serialized = match serde_json::to_vec(&request_body) {
             Ok(bytes) => bytes,
             Err(err) => {
@@ -535,8 +555,11 @@ async fn proxy_with_local_bridge(
         let local_calls: Vec<&FunctionCall> = calls.iter().filter(|c| is_local(&c.name)).collect();
 
         if local_calls.is_empty() {
-            // No local tool call — re-emit the collected SSE verbatim (sandbox
-            // function_call or plain message), same as the transparent path.
+            // No local tool call — a `sandbox__*` call or a plain message. Strip the
+            // `sandbox__` prefix from any function_call names so codex sees its real
+            // tools, then hand the turn back (codex executes in-sandbox and drives
+            // its own loop; we re-rename on its next model call).
+            let rewritten = strip_sandbox_prefix_in_sse(&sse);
             let mut builder = Response::builder().status(status.as_u16());
             for (name, value) in resp_headers.iter() {
                 match name.as_str() {
@@ -544,7 +567,7 @@ async fn proxy_with_local_bridge(
                     _ => builder = builder.header(name.clone(), value.clone()),
                 }
             }
-            return match builder.body(Body::from(collected)) {
+            return match builder.body(Body::from(rewritten)) {
                 Ok(resp) => resp,
                 Err(err) => {
                     tracing::error!(error = %err, "sandbox model proxy response build failed");
@@ -555,6 +578,18 @@ async fn proxy_with_local_bridge(
                         .into_response()
                 }
             };
+        }
+
+        // Phase-1 limitation: a single turn that mixes `local__*` and `sandbox__*`
+        // calls only runs the local ones (the sandbox calls are dropped this turn).
+        // The env guidance instructs the model to use one environment per turn.
+        if calls.len() > local_calls.len() {
+            tracing::warn!(
+                thread_key = %thread_key,
+                total = calls.len(),
+                local = local_calls.len(),
+                "sandbox model proxy: mixed local+sandbox calls in one turn; running local only"
+            );
         }
 
         // Forward each local call to the user's CLI via the bridge and block on
@@ -646,6 +681,112 @@ pub fn inject_bridge_local_tools(body: &mut Value, local_tools: Option<&Value>) 
         Some(Value::Array(existing)) => existing.extend(renamed),
         _ => body["tools"] = Value::Array(renamed),
     }
+}
+
+/// Rename the sandbox agent's own (unprefixed) tools to `sandbox__<name>` so the
+/// model sees a symmetric, environment-tagged menu next to the injected `local__`
+/// tools. Idempotent: already-prefixed names and nameless typed builtins are left
+/// untouched. Call this BEFORE injecting local tools (it only renames codex's).
+pub fn rename_native_tools_to_sandbox(body: &mut Value) {
+    let Some(Value::Array(tools)) = body.get_mut("tools") else {
+        return;
+    };
+    for tool in tools.iter_mut() {
+        if let Some(name) = tool.get("name").and_then(Value::as_str)
+            && !is_env_prefixed(name)
+        {
+            tool["name"] = Value::String(format!("{SANDBOX_TOOL_PREFIX}{name}"));
+        }
+    }
+}
+
+/// Rename unprefixed `function_call` items in `input[]` (the sandbox agent's prior
+/// calls) to `sandbox__<name>`, keeping the conversation history's tool names
+/// consistent with the renamed `tools[]`. Proxy-appended `local__` calls already
+/// carry their prefix and are left as-is. Idempotent.
+pub fn rename_input_history_to_sandbox(body: &mut Value) {
+    let Some(Value::Array(input)) = body.get_mut("input") else {
+        return;
+    };
+    for item in input.iter_mut() {
+        if item.get("type").and_then(Value::as_str) == Some("function_call")
+            && let Some(name) = item.get("name").and_then(Value::as_str)
+            && !is_env_prefixed(name)
+        {
+            item["name"] = Value::String(format!("{SANDBOX_TOOL_PREFIX}{name}"));
+        }
+    }
+}
+
+/// Marker that makes [`append_env_guidance`] idempotent.
+const ENV_GUIDANCE_MARKER: &str = "# Tool environments";
+
+/// Environment-selection guidance appended to the request `instructions` so the
+/// model knows what `sandbox__*` vs `local__*` mean and how to pick. Phase 1:
+/// one environment per turn (cover "both" by sequencing across turns).
+const ENV_GUIDANCE: &str = "\n\n# Tool environments\nTools are namespaced by where they run:\n- `sandbox__*` — an ephemeral cloud sandbox (its own files, the deployment's credentials and kubeconfig, cluster network).\n- `local__*` — the user's local machine (their working files, local credentials, and network).\nChoose the environment that matches the task: cluster/deploy/CI or sandbox files → `sandbox__*`; the user's local files, processes, or machine → `local__*`. If the user names an environment, use only that one. For read-only or diagnostic requests that aren't specific to one side (machine specs, OS, tool versions, env vars), check BOTH and report each. Call tools for only ONE environment per turn; to cover both, use one environment this turn and the other next turn.";
+
+/// Append the environment-selection guidance to the Responses request
+/// `instructions` (creating it if absent). Idempotent via [`ENV_GUIDANCE_MARKER`].
+pub fn append_env_guidance(body: &mut Value) {
+    let current = body
+        .get("instructions")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if current.contains(ENV_GUIDANCE_MARKER) {
+        return;
+    }
+    body["instructions"] = Value::String(format!("{current}{ENV_GUIDANCE}"));
+}
+
+/// Strip the `sandbox__` routing prefix from every `function_call` item name in a
+/// Responses SSE stream, so when the proxy hands a sandbox-only turn back to codex
+/// it sees its real tool names. Each `data:` line is parsed as JSON and rewritten
+/// only if it changed; non-JSON / unaffected lines pass through verbatim.
+pub fn strip_sandbox_prefix_in_sse(sse: &str) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    for line in sse.split('\n') {
+        if let Some(rest) = line.trim_start().strip_prefix("data:") {
+            let data = rest.trim();
+            if !data.is_empty()
+                && data != "[DONE]"
+                && let Ok(mut value) = serde_json::from_str::<Value>(data)
+                && strip_sandbox_names(&mut value)
+            {
+                lines.push(format!("data: {value}"));
+                continue;
+            }
+        }
+        lines.push(line.to_string());
+    }
+    lines.join("\n")
+}
+
+/// Recursively strip the `sandbox__` prefix from the `name` of every
+/// `function_call` object in a JSON value. Returns whether anything changed.
+fn strip_sandbox_names(value: &mut Value) -> bool {
+    let mut changed = false;
+    match value {
+        Value::Object(map) => {
+            if map.get("type").and_then(Value::as_str) == Some("function_call")
+                && let Some(Value::String(name)) = map.get_mut("name")
+                && let Some(stripped) = name.strip_prefix(SANDBOX_TOOL_PREFIX)
+            {
+                *name = stripped.to_owned();
+                changed = true;
+            }
+            for child in map.values_mut() {
+                changed |= strip_sandbox_names(child);
+            }
+        }
+        Value::Array(items) => {
+            for child in items.iter_mut() {
+                changed |= strip_sandbox_names(child);
+            }
+        }
+        _ => {}
+    }
+    changed
 }
 
 /// Inject the fixed stub set of local tools into the Responses request's
@@ -1060,6 +1201,78 @@ mod tests {
 
         inject_bridge_local_tools(&mut body, Some(&json!([])));
         assert!(body.get("tools").is_none());
+    }
+
+    #[test]
+    fn rename_native_tools_prefixes_unprefixed_and_is_idempotent() {
+        let mut body = json!({
+            "tools": [
+                { "type": "function", "name": "exec_command" },
+                { "type": "function", "name": "local__echo" }, // already local — skip
+                { "type": "web_search" },                       // nameless — skip
+            ]
+        });
+        rename_native_tools_to_sandbox(&mut body);
+        let tools = body["tools"].as_array().unwrap();
+        assert_eq!(tools[0]["name"], "sandbox__exec_command");
+        assert_eq!(tools[1]["name"], "local__echo");
+        assert!(tools[2].get("name").is_none());
+        // Idempotent: a second pass does not double-prefix.
+        rename_native_tools_to_sandbox(&mut body);
+        assert_eq!(body["tools"][0]["name"], "sandbox__exec_command");
+    }
+
+    #[test]
+    fn rename_input_history_prefixes_only_unprefixed_function_calls() {
+        let mut body = json!({
+            "input": [
+                { "type": "message", "role": "user", "content": "hi" },
+                { "type": "function_call", "name": "exec_command", "call_id": "c1", "arguments": "{}" },
+                { "type": "function_call", "name": "local__echo", "call_id": "c2", "arguments": "{}" },
+            ]
+        });
+        rename_input_history_to_sandbox(&mut body);
+        let input = body["input"].as_array().unwrap();
+        assert_eq!(input[0]["type"], "message"); // untouched
+        assert_eq!(input[1]["name"], "sandbox__exec_command");
+        assert_eq!(input[2]["name"], "local__echo"); // local left as-is
+    }
+
+    #[test]
+    fn append_env_guidance_adds_once_and_preserves_existing() {
+        let mut body = json!({ "instructions": "Base system prompt." });
+        append_env_guidance(&mut body);
+        let instr = body["instructions"].as_str().unwrap();
+        assert!(instr.starts_with("Base system prompt."));
+        assert!(instr.contains("sandbox__*"));
+        assert!(instr.contains("local__*"));
+        // Idempotent: second call does not duplicate the block.
+        append_env_guidance(&mut body);
+        assert_eq!(
+            body["instructions"].as_str().unwrap().matches("# Tool environments").count(),
+            1
+        );
+        // Creates instructions when absent.
+        let mut bare = json!({ "model": "codex" });
+        append_env_guidance(&mut bare);
+        assert!(bare["instructions"].as_str().unwrap().contains("# Tool environments"));
+    }
+
+    #[test]
+    fn strip_sandbox_prefix_in_sse_unprefixes_function_calls_only() {
+        let sse = concat!(
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"name\":\"sandbox__exec_command\",\"call_id\":\"c1\",\"arguments\":\"\"}}\n",
+            "data: {\"type\":\"response.output_item.added\",\"output_index\":1,\"item\":{\"type\":\"function_call\",\"name\":\"local__echo\",\"call_id\":\"c2\",\"arguments\":\"\"}}\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n",
+            "data: [DONE]\n",
+        );
+        let out = strip_sandbox_prefix_in_sse(sse);
+        // sandbox__ stripped, local__ preserved, message + [DONE] untouched.
+        let calls = parse_function_calls(&out);
+        assert_eq!(calls[0].name, "exec_command");
+        assert_eq!(calls[1].name, "local__echo");
+        assert!(out.contains("\"delta\":\"hello\""));
+        assert!(out.contains("[DONE]"));
     }
 
     #[test]
