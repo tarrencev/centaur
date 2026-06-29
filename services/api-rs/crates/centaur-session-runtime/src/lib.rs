@@ -1566,7 +1566,7 @@ impl SessionRuntime {
                 harness_type,
                 persona_context.as_ref(),
             );
-            apply_session_sandbox_overrides(&mut spec, harness_type, overrides);
+            apply_session_sandbox_overrides(&mut spec, harness_type, thread_key, overrides);
             if let Some(principal) = iron_control_principal {
                 spec.iron_control_principal = Some(principal.to_owned());
             }
@@ -2216,8 +2216,31 @@ fn harness_server_subcommand(harness: &HarnessType) -> &'static str {
 fn apply_session_sandbox_overrides(
     spec: &mut SandboxSpec,
     harness: &HarnessType,
+    thread_key: &ThreadKey,
     overrides: SessionSandboxOverrides<'_>,
 ) {
+    // Route the sandbox codex's model calls through Centaur's proxy with the
+    // session's thread_key embedded in the URL. Gated on
+    // CENTAUR_SANDBOX_MODEL_PROXY_BASE: when unset/empty this is a no-op and the
+    // sandbox talks to its configured upstream (hydra) directly, exactly as
+    // before. Independent of harness — it only rewrites an existing
+    // CODEX_CONFIG_OVERLAY base_url, so sessions without one are untouched.
+    if let Ok(proxy_base) = std::env::var("CENTAUR_SANDBOX_MODEL_PROXY_BASE") {
+        let proxy_base = proxy_base.trim();
+        if !proxy_base.is_empty() {
+            if let Some(overlay) = spec
+                .env
+                .iter()
+                .find(|env| env.name == "CODEX_CONFIG_OVERLAY")
+                .map(|env| env.value.clone())
+            {
+                let rewritten =
+                    rewrite_codex_base_url(&overlay, proxy_base, thread_key.as_str());
+                upsert_env(spec, "CODEX_CONFIG_OVERLAY", &rewritten);
+            }
+        }
+    }
+
     // PR A intentionally scopes request model/system to ClaudeCode. Codex and
     // Amp request-level model/system handling need separate harness semantics.
     if !matches!(harness, HarnessType::ClaudeCode) {
@@ -2243,6 +2266,41 @@ fn upsert_env(spec: &mut SandboxSpec, name: &str, value: &str) {
 fn non_empty_str(value: &str) -> Option<&str> {
     let value = value.trim();
     (!value.is_empty()).then_some(value)
+}
+
+/// Rewrite the `base_url = "..."` line of a CODEX_CONFIG_OVERLAY TOML string to
+/// point the sandbox codex at Centaur's model proxy, with the session's
+/// thread_key embedded as a single percent-encoded path segment:
+/// `{proxy_base}/s/{enc(thread_key)}`.
+///
+/// All other lines (and any leading indentation on the base_url line) are
+/// preserved verbatim, as is a trailing newline. If the overlay has no
+/// `base_url = ...` line it is returned unchanged. Pure/testable.
+fn rewrite_codex_base_url(overlay: &str, proxy_base: &str, thread_key: &str) -> String {
+    let enc = urlencoding::encode(thread_key);
+    let new_base = format!("{}/s/{}", proxy_base.trim_end_matches('/'), enc);
+
+    let mut lines: Vec<String> = Vec::new();
+    for line in overlay.lines() {
+        let trimmed = line.trim_start();
+        // Match a `base_url` key assignment (TOML), ignoring leading whitespace.
+        let is_base_url = trimmed
+            .strip_prefix("base_url")
+            .map(|rest| rest.trim_start().starts_with('='))
+            .unwrap_or(false);
+        if is_base_url {
+            let indent = &line[..line.len() - trimmed.len()];
+            lines.push(format!("{indent}base_url = \"{new_base}\""));
+        } else {
+            lines.push(line.to_string());
+        }
+    }
+
+    let mut result = lines.join("\n");
+    if overlay.ends_with('\n') {
+        result.push('\n');
+    }
+    result
 }
 
 fn sandbox_spec_key(spec: &SandboxSpec) -> String {
@@ -4837,6 +4895,61 @@ mod tests {
     use time::OffsetDateTime;
 
     #[test]
+    fn rewrite_codex_base_url_replaces_base_url_and_preserves_other_lines() {
+        let overlay = concat!(
+            "model = \"codex\"\n",
+            "base_url = \"https://hydra.64.34.84.225.sslip.io/backend-api/codex\"\n",
+            "wire_api = \"responses\"\n",
+        );
+        let out = rewrite_codex_base_url(
+            overlay,
+            "http://centaur-centaur-api-rs.centaur:8080/sandbox/model",
+            "api:codex:abc-123",
+        );
+        assert!(out.contains("model = \"codex\""));
+        assert!(out.contains("wire_api = \"responses\""));
+        assert!(out.contains(
+            "base_url = \"http://centaur-centaur-api-rs.centaur:8080/sandbox/model/s/api%3Acodex%3Aabc-123\""
+        ));
+        // Only the base_url line changed; line count and trailing newline preserved.
+        assert_eq!(out.lines().count(), overlay.lines().count());
+        assert!(out.ends_with('\n'));
+    }
+
+    #[test]
+    fn rewrite_codex_base_url_handles_missing_base_url_gracefully() {
+        let overlay = "model = \"codex\"\nwire_api = \"responses\"\n";
+        let out = rewrite_codex_base_url(overlay, "http://proxy/sandbox/model", "api:codex:x");
+        assert_eq!(out, overlay);
+    }
+
+    #[test]
+    fn rewrite_codex_base_url_preserves_indentation() {
+        let overlay = "[model_providers.centaur]\n  base_url = \"https://old\"\n";
+        let out = rewrite_codex_base_url(overlay, "http://proxy/sandbox/model", "k");
+        assert!(out.contains("  base_url = \"http://proxy/sandbox/model/s/k\""));
+        assert!(out.starts_with("[model_providers.centaur]\n"));
+    }
+
+    #[test]
+    fn rewrite_codex_base_url_thread_key_round_trips() {
+        // Encode here; the proxy's parse_session_path decodes the same segment.
+        let out = rewrite_codex_base_url(
+            "base_url = \"https://old\"\n",
+            "http://proxy/sandbox/model",
+            "api:codex:abc-123",
+        );
+        let enc = out
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("base_url = \""))
+            .and_then(|s| s.strip_suffix('"'))
+            .and_then(|u| u.rsplit("/s/").next())
+            .unwrap();
+        let decoded = urlencoding::decode(enc).unwrap();
+        assert_eq!(decoded, "api:codex:abc-123");
+    }
+
+    #[test]
     fn persona_registry_validates_default_and_summarizes_without_prompt() {
         let registry = PersonaRegistry::new(
             [PersonaDefinition {
@@ -6243,6 +6356,7 @@ mod adoption_tests {
                 Some("sbx-old"),
                 None,
                 &execution_id,
+                SessionSandboxOverrides::default(),
             )
             .await
             .expect("resume failure should fall through to replacement");

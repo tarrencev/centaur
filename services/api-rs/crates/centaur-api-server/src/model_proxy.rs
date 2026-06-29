@@ -61,9 +61,17 @@ pub async fn proxy_sandbox_model(req: Request) -> Response {
     let rest = path_and_query
         .strip_prefix("/sandbox/model")
         .unwrap_or(path_and_query);
+    // The session-runtime may embed the session's thread_key as a leading
+    // `/s/{enc}` path segment (see rewrite_codex_base_url). Strip it off so the
+    // upstream path is byte-for-byte what it would be without the segment. For
+    // this increment the extracted thread_key is only logged.
+    let (session_thread_key, forward_path) = parse_session_path(rest);
+    if let Some(thread_key) = &session_thread_key {
+        tracing::debug!(thread_key = %thread_key, "sandbox model proxy: session-scoped request");
+    }
     let upstream = env::var("CENTAUR_SANDBOX_MODEL_UPSTREAM")
         .unwrap_or_else(|_| "https://hydra.64.34.84.225.sslip.io/backend-api/codex".to_string());
-    let url = format!("{}{}", upstream.trim_end_matches('/'), rest);
+    let url = format!("{}{}", upstream.trim_end_matches('/'), forward_path);
 
     let body_bytes = match axum::body::to_bytes(body, usize::MAX).await {
         Ok(bytes) => bytes,
@@ -85,6 +93,30 @@ pub async fn proxy_sandbox_model(req: Request) -> Response {
     } else {
         transparent_passthrough(&parts.method, &url, &parts.headers, body_bytes).await
     }
+}
+
+/// Split an optional leading `/s/{enc_thread_key}` session segment off the
+/// proxy path (the remainder after `/sandbox/model` has been stripped).
+///
+/// Returns `(thread_key, upstream_path)`:
+/// - `/s/{enc}/responses` -> `(Some(percent-decoded enc), "/responses")`
+/// - anything else (e.g. `/responses`) -> `(None, <rest unchanged>)`
+///
+/// The thread_key is the percent-decoded first segment; the upstream path is
+/// everything after that segment, so for non-session paths the forwarded path
+/// is byte-for-byte identical to the input. Pure/testable.
+fn parse_session_path(rest: &str) -> (Option<String>, String) {
+    let Some(after) = rest.strip_prefix("/s/") else {
+        return (None, rest.to_string());
+    };
+    let (segment, tail) = match after.find('/') {
+        Some(idx) => (&after[..idx], &after[idx..]),
+        None => (after, ""),
+    };
+    let decoded = urlencoding::decode(segment)
+        .map(|s| s.into_owned())
+        .unwrap_or_else(|_| segment.to_string());
+    (Some(decoded), tail.to_string())
 }
 
 /// Build the upstream request: forward method/headers/body, drop hop-by-hop and
@@ -454,6 +486,34 @@ pub fn append_followup(body: &mut Value, call: &FunctionCall, output: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_session_path_extracts_decoded_thread_key_and_upstream_path() {
+        let (tk, path) = parse_session_path("/s/api%3Acodex%3Aabc-123/responses");
+        assert_eq!(tk.as_deref(), Some("api:codex:abc-123"));
+        assert_eq!(path, "/responses");
+    }
+
+    #[test]
+    fn parse_session_path_passes_through_non_session_paths() {
+        let (tk, path) = parse_session_path("/responses");
+        assert_eq!(tk, None);
+        assert_eq!(path, "/responses");
+    }
+
+    #[test]
+    fn parse_session_path_handles_segment_without_trailing_path() {
+        let (tk, path) = parse_session_path("/s/api%3Acodex%3Ax");
+        assert_eq!(tk.as_deref(), Some("api:codex:x"));
+        assert_eq!(path, "");
+    }
+
+    #[test]
+    fn parse_session_path_preserves_query_string() {
+        let (tk, path) = parse_session_path("/s/k/responses?stream=true");
+        assert_eq!(tk.as_deref(), Some("k"));
+        assert_eq!(path, "/responses?stream=true");
+    }
 
     #[test]
     fn inject_local_tools_creates_array_when_absent() {
