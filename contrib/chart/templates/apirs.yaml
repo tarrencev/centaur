@@ -228,6 +228,17 @@ spec:
             - name: CENTAUR_OVERLAY_DIR
               value: {{ .Values.overlay.mountPath | quote }}
 {{- end }}
+{{- if $useOverlayRepoCache }}
+            # Point the sandbox CENTAUR_OVERLAY_DIR at the org overlay clone
+            # under the repos mount (/home/agent/github/<repo>). The org overlay
+            # is the highest-priority (last) repo-cache overlay source -- the one
+            # that shadows the base and carries the org's services/sandbox/
+            # SYSTEM_PROMPT.md and .agents/skills. api-rs derives the sandbox env
+            # from this slug. Repo-cache delivery only (overlay-image mode sets
+            # CENTAUR_OVERLAY_DIR above from overlay.mountPath).
+            - name: CENTAUR_OVERLAY_REPO
+              value: {{ (last $overlaySources).repo | quote }}
+{{- end }}
             - name: SESSION_SANDBOX_BACKEND
               value: {{ .Values.apiRs.sandboxBackend | quote }}
             - name: SESSION_SANDBOX_WORKLOAD
