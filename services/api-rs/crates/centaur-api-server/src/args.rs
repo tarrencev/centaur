@@ -11,7 +11,7 @@ use std::{
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
-use centaur_api_server::SandboxRuntime;
+use centaur_api_server::{ApiServerConfig, SandboxModelAuthMode, SandboxRuntime};
 use centaur_iron_control::{
     IdentityInput, IronControlClient, IronControlError, RegisterError, RoleSpec, SessionRegistrar,
     register_role,
@@ -63,6 +63,10 @@ pub(crate) struct Args {
 }
 
 impl Args {
+    pub(crate) fn api_config(&self) -> ApiServerConfig {
+        self.server.api_config()
+    }
+
     pub(crate) async fn sandbox_runtime(&self) -> Result<SandboxRuntime, ServerError> {
         self.sandbox.runtime().await
     }
@@ -452,6 +456,65 @@ pub(crate) struct ServerArgs {
     pub(crate) bind_addr: SocketAddr,
     #[arg(long, env = "RUN_MIGRATIONS", default_value_t = false)]
     pub(crate) run_migrations: bool,
+    #[arg(long = "v1-api-key", env = "CENTAUR_V1_API_KEY")]
+    v1_api_key: Option<String>,
+    #[arg(
+        long = "v1-allow-unauthenticated",
+        env = "CENTAUR_V1_ALLOW_UNAUTHENTICATED",
+        default_value_t = false
+    )]
+    v1_allow_unauthenticated: bool,
+    #[arg(
+        long = "v1-idle-timeout-ms",
+        env = "CENTAUR_V1_IDLE_TIMEOUT_MS",
+        default_value_t = 60_000
+    )]
+    v1_idle_timeout_ms: u64,
+    #[arg(
+        long = "v1-max-duration-ms",
+        env = "CENTAUR_V1_MAX_DURATION_MS",
+        default_value_t = 1_800_000
+    )]
+    v1_max_duration_ms: u64,
+    #[arg(
+        long = "sandbox-model-auth",
+        env = "CENTAUR_SANDBOX_MODEL_AUTH",
+        value_enum,
+        default_value = "required"
+    )]
+    sandbox_model_auth: SandboxModelAuthArg,
+}
+
+impl ServerArgs {
+    fn api_config(&self) -> ApiServerConfig {
+        ApiServerConfig {
+            v1_api_key: self
+                .v1_api_key
+                .as_deref()
+                .map(str::trim)
+                .filter(|key| !key.is_empty())
+                .map(str::to_owned),
+            v1_allow_unauthenticated: self.v1_allow_unauthenticated,
+            v1_idle_timeout_ms: self.v1_idle_timeout_ms,
+            v1_max_duration_ms: self.v1_max_duration_ms,
+            sandbox_model_auth: self.sandbox_model_auth.into(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum SandboxModelAuthArg {
+    Required,
+    Off,
+}
+
+impl From<SandboxModelAuthArg> for SandboxModelAuthMode {
+    fn from(value: SandboxModelAuthArg) -> Self {
+        match value {
+            SandboxModelAuthArg::Required => SandboxModelAuthMode::Required,
+            SandboxModelAuthArg::Off => SandboxModelAuthMode::Off,
+        }
+    }
 }
 
 #[derive(Debug, ClapArgs)]
@@ -2141,6 +2204,57 @@ mod tests {
         assert_eq!(args.sandbox.k8s_namespace, "centaur-test");
         assert_eq!(args.sandbox.ready_timeout_secs, 17);
         assert_eq!(args.sandbox.k8s_context.as_deref(), Some("kind-test"));
+    }
+
+    #[test]
+    fn parses_security_server_flags() {
+        let args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+            "--v1-api-key",
+            "shared-secret",
+            "--v1-allow-unauthenticated",
+            "--v1-idle-timeout-ms",
+            "1234",
+            "--v1-max-duration-ms",
+            "5678",
+            "--sandbox-model-auth",
+            "off",
+        ])
+        .unwrap();
+
+        let config = args.api_config();
+        assert_eq!(config.v1_api_key.as_deref(), Some("shared-secret"));
+        assert!(config.v1_allow_unauthenticated);
+        assert_eq!(config.v1_idle_timeout_ms, 1234);
+        assert_eq!(config.v1_max_duration_ms, 5678);
+        assert_eq!(config.sandbox_model_auth, SandboxModelAuthMode::Off);
+    }
+
+    #[test]
+    fn parses_security_server_env_vars() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _env = EnvGuard::set(&[
+            ("CENTAUR_V1_API_KEY", "env-secret"),
+            ("CENTAUR_V1_ALLOW_UNAUTHENTICATED", "true"),
+            ("CENTAUR_V1_IDLE_TIMEOUT_MS", "2222"),
+            ("CENTAUR_V1_MAX_DURATION_MS", "3333"),
+            ("CENTAUR_SANDBOX_MODEL_AUTH", "off"),
+        ]);
+        let args = Args::try_parse_from([
+            "centaur-api-server",
+            "--database-url",
+            "postgres://postgres:postgres@localhost/centaur",
+        ])
+        .unwrap();
+
+        let config = args.api_config();
+        assert_eq!(config.v1_api_key.as_deref(), Some("env-secret"));
+        assert!(config.v1_allow_unauthenticated);
+        assert_eq!(config.v1_idle_timeout_ms, 2222);
+        assert_eq!(config.v1_max_duration_ms, 3333);
+        assert_eq!(config.sandbox_model_auth, SandboxModelAuthMode::Off);
     }
 
     #[test]

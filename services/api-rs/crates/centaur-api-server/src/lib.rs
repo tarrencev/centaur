@@ -9,8 +9,9 @@ pub mod types;
 pub use centaur_session_runtime::{SandboxRuntime, SessionRuntime};
 pub use error::ApiError;
 pub use routes::{
-    AppState, build_router_with_app_state, build_router_with_runtime,
-    build_router_with_session_and_workflow_runtime, build_router_with_session_runtime,
+    ApiServerConfig, AppState, SandboxModelAuthMode, build_router_with_app_state,
+    build_router_with_runtime, build_router_with_session_and_workflow_runtime,
+    build_router_with_session_runtime,
 };
 
 #[cfg(test)]
