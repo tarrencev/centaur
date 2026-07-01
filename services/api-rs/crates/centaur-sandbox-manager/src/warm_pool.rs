@@ -1,7 +1,10 @@
 use std::{sync::Arc, time::Duration};
 
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use centaur_sandbox_core::{SandboxError, SandboxId, SandboxSpec, SandboxStatus};
 use centaur_session_sqlx::{PgSessionStore, SessionStoreError};
+use rand::random;
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::time::{MissedTickBehavior, interval};
 use tracing::{info, warn};
@@ -9,6 +12,7 @@ use tracing::{info, warn};
 use crate::SandboxManager;
 
 pub type WarmSandboxSpecFactory = Arc<dyn Fn() -> SandboxSpec + Send + Sync>;
+pub const SANDBOX_MODEL_TOKEN_ENV: &str = "CENTAUR_SANDBOX_MODEL_TOKEN";
 
 pub struct WarmPoolConfig {
     pub target_size: usize,
@@ -170,10 +174,17 @@ impl WarmPoolManager {
             if let Some(principal_id) = &self.config.bootstrap_iron_control_principal {
                 spec.iron_control_principal = Some(principal_id.clone());
             }
+            let token = mint_sandbox_model_token();
+            let token_hash = sandbox_model_token_hash(&token);
+            spec = spec.env(SANDBOX_MODEL_TOKEN_ENV, token);
             let handle = self.manager.create_running(spec).await?;
             if let Err(error) = self
                 .store
-                .insert_ready_warm_sandbox(handle.id.as_str(), self.workload_key.as_str())
+                .insert_ready_warm_sandbox(
+                    handle.id.as_str(),
+                    self.workload_key.as_str(),
+                    Some(&token_hash),
+                )
                 .await
             {
                 let _ = self.manager.stop(&handle.id).await;
@@ -182,6 +193,151 @@ impl WarmPoolManager {
         }
 
         Ok(())
+    }
+}
+
+fn mint_sandbox_model_token() -> String {
+    let bytes: [u8; 32] = random();
+    URL_SAFE_NO_PAD.encode(bytes)
+}
+
+pub fn sandbox_model_token_hash(token: &str) -> String {
+    hex::encode(Sha256::digest(token.as_bytes()))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        env,
+        sync::{Arc, Mutex},
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    use async_trait::async_trait;
+    use centaur_sandbox_core::{
+        ObservedSandbox, SandboxBackend, SandboxError, SandboxHandle, SandboxId, SandboxIo,
+        SandboxResult, SandboxSpec, SandboxStatus,
+    };
+
+    use super::*;
+
+    #[tokio::test]
+    async fn replenish_injects_model_token_and_stores_hash() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let backend = Arc::new(FakeBackend::default());
+        let manager = Arc::new(SandboxManager::new(backend.clone()));
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let workload_key = format!("test-workload-{}-{nonce}", std::process::id());
+        let warm_pool = WarmPoolManager::new(
+            manager,
+            store.clone(),
+            Arc::new(|| SandboxSpec::new("mock")),
+            workload_key,
+            WarmPoolConfig {
+                target_size: 1,
+                replenish_interval: Duration::from_secs(60),
+                bootstrap_iron_control_principal: None,
+            },
+        );
+
+        warm_pool.replenish_once().await.expect("replenish");
+
+        let specs = backend.created_specs();
+        assert_eq!(specs.len(), 1);
+        let token = specs[0]
+            .env
+            .iter()
+            .find(|env| env.name == SANDBOX_MODEL_TOKEN_ENV)
+            .map(|env| env.value.as_str())
+            .expect("model token env");
+        assert!(!token.is_empty());
+        let record = store
+            .find_warm_sandbox_by_token_hash(&sandbox_model_token_hash(token))
+            .await
+            .expect("lookup token hash")
+            .expect("warm sandbox row");
+        assert_eq!(record.sandbox_id, "fake-sbx-1");
+        assert_eq!(record.status, "ready");
+    }
+
+    async fn test_store() -> Option<PgSessionStore> {
+        let Ok(url) = env::var("SESSION_SQLX_TEST_DATABASE_URL")
+            .or_else(|_| env::var("SESSION_RUNTIME_TEST_DATABASE_URL"))
+        else {
+            return None;
+        };
+        let store = PgSessionStore::connect(&url)
+            .await
+            .expect("connect test db");
+        store.run_migrations().await.expect("run migrations");
+        Some(store)
+    }
+
+    #[derive(Default)]
+    struct FakeBackend {
+        created: Mutex<Vec<SandboxSpec>>,
+    }
+
+    impl FakeBackend {
+        fn created_specs(&self) -> Vec<SandboxSpec> {
+            self.created.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl SandboxBackend for FakeBackend {
+        fn name(&self) -> &'static str {
+            "fake"
+        }
+
+        async fn create(&self, spec: SandboxSpec) -> SandboxResult<SandboxHandle> {
+            let mut created = self.created.lock().unwrap();
+            created.push(spec);
+            Ok(SandboxHandle::new(
+                format!("fake-sbx-{}", created.len()),
+                self.name(),
+            ))
+        }
+
+        async fn open_io(&self, _id: &SandboxId) -> SandboxResult<SandboxIo> {
+            Err(SandboxError::Unsupported {
+                backend: self.name(),
+                operation: "open_io",
+            })
+        }
+
+        async fn status(&self, _id: &SandboxId) -> SandboxResult<SandboxStatus> {
+            Ok(SandboxStatus::Running)
+        }
+
+        async fn observe(&self, id: &SandboxId) -> SandboxResult<ObservedSandbox> {
+            Ok(ObservedSandbox::new(
+                id.as_str(),
+                self.name(),
+                SandboxStatus::Running,
+            ))
+        }
+
+        async fn list_observed(&self) -> SandboxResult<Vec<ObservedSandbox>> {
+            Ok(Vec::new())
+        }
+
+        async fn stop(&self, _id: &SandboxId) -> SandboxResult<()> {
+            Ok(())
+        }
+
+        async fn pause(&self, _id: &SandboxId) -> SandboxResult<()> {
+            Ok(())
+        }
+
+        async fn resume(&self, _id: &SandboxId) -> SandboxResult<()> {
+            Ok(())
+        }
     }
 }
 

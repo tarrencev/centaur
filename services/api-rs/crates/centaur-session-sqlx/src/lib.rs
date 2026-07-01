@@ -50,6 +50,13 @@ pub struct WorkflowOwnedSandbox {
     pub sandbox_id: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, FromRow)]
+pub struct WarmSandboxAuthRecord {
+    pub sandbox_id: String,
+    pub status: String,
+    pub claimed_thread_key: Option<String>,
+}
+
 #[derive(Clone)]
 pub struct PgSessionStore {
     pool: PgPool,
@@ -740,18 +747,37 @@ impl PgSessionStore {
         &self,
         sandbox_id: &str,
         workload_key: &str,
+        bearer_token_hash: Option<&str>,
     ) -> Result<(), SessionStoreError> {
         sqlx::query(
             r#"
-            insert into session_warm_sandboxes (sandbox_id, workload_key, status)
-            values ($1, $2, 'ready')
+            insert into session_warm_sandboxes (sandbox_id, workload_key, status, bearer_token_hash)
+            values ($1, $2, 'ready', $3)
             "#,
         )
         .bind(sandbox_id)
         .bind(workload_key)
+        .bind(bearer_token_hash)
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    pub async fn find_warm_sandbox_by_token_hash(
+        &self,
+        bearer_token_hash: &str,
+    ) -> Result<Option<WarmSandboxAuthRecord>, SessionStoreError> {
+        let record = sqlx::query_as::<_, WarmSandboxAuthRecord>(
+            r#"
+            select sandbox_id, status, claimed_thread_key
+            from session_warm_sandboxes
+            where bearer_token_hash = $1
+            "#,
+        )
+        .bind(bearer_token_hash)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(record)
     }
 
     pub async fn count_ready_warm_sandboxes(
@@ -1189,7 +1215,11 @@ pub fn default_metadata(metadata: Option<Value>) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use super::SessionEventNotification;
+    use std::env;
+
+    use centaur_session_core::{HarnessType, ThreadKey, empty_object};
+
+    use super::{PgSessionStore, SessionEventNotification};
 
     #[test]
     fn parses_session_event_notification_payload() {
@@ -1203,5 +1233,65 @@ mod tests {
                 event_id: 42,
             }
         );
+    }
+
+    #[tokio::test]
+    async fn find_warm_sandbox_by_token_hash_returns_claimed_row() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let thread_key =
+            ThreadKey::parse(format!("test:warm-token-{}", uuid::Uuid::new_v4())).unwrap();
+        store
+            .create_or_get_session(&thread_key, &HarnessType::Codex, None, empty_object())
+            .await
+            .expect("create session");
+        let sandbox_id = format!("sbx-token-{}", uuid::Uuid::new_v4());
+        let token_hash = format!("hash-{}", uuid::Uuid::new_v4());
+        store
+            .insert_ready_warm_sandbox(&sandbox_id, "test-workload", Some(&token_hash))
+            .await
+            .expect("insert warm sandbox");
+
+        let ready = store
+            .find_warm_sandbox_by_token_hash(&token_hash)
+            .await
+            .expect("lookup ready")
+            .expect("ready row");
+        assert_eq!(ready.sandbox_id, sandbox_id);
+        assert_eq!(ready.status, "ready");
+        assert_eq!(ready.claimed_thread_key, None);
+
+        assert_eq!(
+            store
+                .claim_ready_warm_sandbox("test-workload", thread_key.as_str())
+                .await
+                .expect("claim warm sandbox")
+                .as_deref(),
+            Some(sandbox_id.as_str())
+        );
+        let claimed = store
+            .find_warm_sandbox_by_token_hash(&token_hash)
+            .await
+            .expect("lookup claimed")
+            .expect("claimed row");
+        assert_eq!(claimed.status, "claimed");
+        assert_eq!(
+            claimed.claimed_thread_key.as_deref(),
+            Some(thread_key.as_str())
+        );
+    }
+
+    async fn test_store() -> Option<PgSessionStore> {
+        let Ok(url) = env::var("SESSION_SQLX_TEST_DATABASE_URL")
+            .or_else(|_| env::var("SESSION_RUNTIME_TEST_DATABASE_URL"))
+        else {
+            return None;
+        };
+        let store = PgSessionStore::connect(&url)
+            .await
+            .expect("connect test db");
+        store.run_migrations().await.expect("run migrations");
+        Some(store)
     }
 }
